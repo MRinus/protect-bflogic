@@ -48,14 +48,25 @@ threshold you calculated by hand.
 
 - A limit can be **frequency-weighted** (`ref_freq_hz` + `slope_db_oct`)
   for physically frequency-dependent limits — e.g. transformer core
-  saturation (ceiling rises ~6 dB/octave) or a sealed-box woofer's Xmax
-  above box resonance (~12 dB/octave). Implemented as a cascade of
-  single-pole filters on that checkpoint's detector input only.
+  saturation (ceiling rises ~6 dB/octave, 1-pole) or a sealed-box
+  woofer's Xmax above box resonance (~12 dB/octave, 2-pole). Implemented
+  as a cascade of single-pole filters (same corner frequency, N =
+  `slope_db_oct`/6 stages) on that one checkpoint's detector input only
+  — other checkpoints in the same group are unaffected. Currently
+  supports 1 or 2 stages (6 or 12 dB/octave); more would be a trivial
+  cascade extension but hasn't been needed yet.
+- A limit can reference just the **first N stages of its chain**
+  (`stage: N;`, 1-indexed) instead of the full chain — needed when
+  several limits in the same group sit at different points along the
+  same cascade (e.g. a transformer's saturation limit measured before
+  a power amp stage, and that amp's rated-power limit measured after
+  it). Omitting `stage` means the full chain. `stage` *replaces* the
+  reference point, it does not add to the chain's total gain.
 - A limit can be **peak** or **RMS** (independent attack/release, or
-  window + release, respectively).
+  window + RMS-release, respectively).
 - Every checkpoint in a group runs in parallel each sample; the applied
   gain reduction is the minimum across all of them — the strictest
-  limit wins automatically.
+  limit wins automatically, no manual priority ordering needed.
 - The module logs its computed dBFS threshold for every checkpoint at
   startup (`fprintf(stderr, ...)`) — **always check this log** against
   your own expectations before trusting a new config.
@@ -77,6 +88,28 @@ BruteFIR's general documentation says about integer format scaling
 elsewhere in the pipeline. The module compensates via an `output_scale`
 config field (default `2147483647.0`, i.e. `S32_LE`) — set this
 explicitly if your config uses a different output format.
+
+## Calibration caveat: where's your volume control?
+
+`dac_max_output_vrms` is a fixed number in your config — it's only a
+correct reference if the real gain between "the buffer this module
+reads" and "the DAC's physical output" never changes at runtime without
+the config being updated to match.
+
+BruteFIR's own volume control (`scale`/`fscale`) is applied to the
+signal *before* it reaches this module's hook (see [Hook
+point](#hook-point) below) — so if that's how you control volume, this
+module already sees the attenuated buffer, and the chain model stays
+correct automatically at any volume setting.
+
+The risk case is a **hardware or ALSA-side volume/gain control that sits
+after this hook** (e.g. on the DAC or downstream of it) and is not
+modeled as a chain stage. `dac_max_output_vrms` implicitly assumes that
+control is fixed at whatever setting was in effect when you measured
+it. If that control can be changed independently at runtime — a mixer
+knob, an ALSA control someone can touch — every threshold in your
+config silently goes stale the moment it's moved. Either keep that
+control hardware-fixed, or model it as an explicit chain stage instead.
 
 ## Build
 
@@ -165,6 +198,31 @@ with the module bypassed, as a reference point.
   "provisional" are estimates from public component data, not measured —
   replace them with your own measured or manufacturer-confirmed values
   before relying on them.
+
+## Example deployment
+
+`examples/protect_example_config.txt` is a real config, not a toy one —
+originally written for a 4-channel active system: two electrostatic
+panels and two sealed woofer towers, crossed over in BruteFIR (90 Hz,
+20th-order Neville-Thiele). It shows both chain patterns this module is
+meant for:
+
+- **Woofer chain** — one gain stage: BruteFIR → DAC (direct XLR) → a
+  Class-D amp in BTL mode. Three limits in one group: mechanical Xmax
+  (frequency-weighted, 2-pole above the sealed box's resonance), amp
+  clipping, and driver thermal (RMS).
+- **ESL chain** — three gain stages in series: DAC → a step-up/isolation
+  transformer → a tube amp's line input → the panel's own internal
+  step-up transformer to the stator. Three limits in one group, each
+  using `stage: N` to measure at a *different* point along that same
+  cascade: transformer saturation (frequency-weighted, right after
+  stage 1), the tube amp's rated power (after stage 2), and the panel's
+  own excursion limit (the full chain).
+
+Note that this example reflects one point-in-time hardware
+configuration; it's included to show the config syntax and modeling
+approach on a real, non-trivial chain, not as a chain topology that
+will match your own system.
 
 ## License
 
