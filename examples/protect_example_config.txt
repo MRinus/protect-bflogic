@@ -1,0 +1,177 @@
+# Beispiel-Einbindung in die BruteFIR-Hauptconfig auf Holographer.
+# Kanalnamen entsprechen den echten Output-Namen aus allen sechs
+# config/sqnt440/sqnt440<rate>-Configs: "subl"/"subr" (Woofer),
+# "esll"/"eslr" (ESL) -- per grep gegen alle sechs Configs geprueft,
+# nicht geraten (2026-08-22).
+#
+# STAND 2026-08-22, nach ausfuehrlicher Architektur-Diskussion:
+# siehe CLAUDE.md in diesem Verzeichnis fuer den vollen Hintergrund.
+# Als PROVISORISCH markierte Werte stammen aus Web-Recherche, nicht
+# aus dem jeweiligen Original-Handbuch -- vor Live-Schaltung durch
+# echte Handbuchwerte ersetzen.
+#
+# WICHTIG: dieser Lexer kennt nur "#"-Zeilenkommentare, KEINE /* */
+# Blockkommentare -- jede Zeile einzeln mit # beginnen.
+
+logic: "protect" {
+    # Modulname "protect" hier oben laedt automatisch
+    # <modules_path>/protect.bflogic -- kein eigenes "filename:"-Feld,
+    # das gibt es in der BruteFIR-Config-Syntax nicht.
+
+    output_scale: 2147483647.0;
+    # KRITISCH, per Trockentest 2026-08-22 empirisch verifiziert:
+    # BruteFIRs interner Puffer an der output_timed()-Stelle ist bei
+    # Integer-Ausgabeformaten (S32_LE, wie in allen sqnt440<rate>-
+    # Configs) NICHT auf +-1.0 normiert, sondern fuehrt die rohe
+    # Integer-Magnitude. Ohne dieses Feld (== Code-Default, hier nur
+    # zur Explizitheit gesetzt) wuerde jede Schwelle sofort und
+    # dauerhaft ueberschritten, Gain kollabiert permanent gegen 0,
+    # unabhaengig vom echten Pegel. Bei einem anderen Ausgabeformat
+    # (S16_LE, FLOAT_LE, ...) muss dieser Wert entsprechend angepasst
+    # werden -- siehe CLAUDE.md "Software-Trockentest" fuer den vollen
+    # Befund.
+
+    # --- Woofer-Kette: Sabaj A20a, direktes XLR, BTL ---
+    chain: "mytek_direct_xlr" {
+        dac_max_output_vrms: 6.91;   # Mytek 0dBFS, Werkskalibrierung
+                                      # -15dBFS=1.228Vrms it. Handbuch
+        {
+            gain_db: 38.8;
+            # Sabaj A20a BTL Spannungsgain, aus Eingangsempfindlichkeit
+            # 430mV/22kOhm (Audiophonics-Produktseite) + 350W/4R BTL-
+            # Rated-Output (37.42Vrms) hergeleitet:
+            # 20*log10(37.42/0.43). PROVISORISCH -- kein Handbuchwert,
+            # nur Web. Setzt zwingend voraus, dass die Sabaj-eigene
+            # Lautstaerke dauerhaft auf Maximum steht (per 2026-08-22
+            # vom Nutzer bestaetigt) -- das kann der Code nicht
+            # pruefen/erzwingen.
+        };
+    };
+
+    # --- ESL-Kette: TRI 88 Signature Main In, ueber Neutrik-Uebertrager,
+    #     dahinter der ESL-eigene 1:60-Step-up zum Stator ---
+    chain: "mytek_via_neutrik_tx" {
+        dac_max_output_vrms: 6.91;
+        {
+            gain_db: 0.0;
+            # Stufe 1: Neutrik NA2*-TX, 1:1 (200:200Ohm), Einfuege-
+            # daempfung vernachlaessigt. Max. Eingangspegel (Saettigung)
+            # lt. Datenblatt: -3dBu @ 50Hz, 1% THD -- vom Nutzer bestaetigt.
+        };
+        {
+            gain_db: 31.0;
+            # Stufe 2: TRI 88 Signature Main-In-Gain, aus Empfindlichkeit
+            # 670mV/10kOhm (audio-database.com, deckt sich mit der
+            # 670-900mV-Schaetzung aus CLAUDE.md) + 70W/8R-Rating
+            # (23.66Vrms): 20*log10(23.66/0.67). PROVISORISCH -- kein
+            # Handbuchwert, nur Web.
+        };
+        {
+            gain_db: 35.6;
+            # Stufe 3: ESL-eigener Step-up-Uebertrager, 1:60 (vom Nutzer
+            # bestaetigt): 20*log10(60). Der Uebertrager soll selbst
+            # ~100W abkoennen -- dessen eigene Saettigung/Thermik ist
+            # bewusst NICHT modelliert (auf Nutzerwunsch zurueckgestellt).
+        };
+    };
+
+    # --- Woofer-Gruppe ---
+    group: {
+        channels: "subl", "subr";
+        chain: "mytek_direct_xlr";
+
+        limit: {
+            name: "xmax";
+            max_vrms: 20.0;
+            # Spannungs-Anker bei/unterhalb Fc, abgeleitete Xmax-Grenze,
+            # bis Nahfeldmessung praezisiert -- weiterhin ein Arbeitswert,
+            # kein Fakt.
+            type: "peak";
+            ref_freq_hz: 44.6;
+            # Fc der geschlossenen Box, errechnet aus Vifa/T+A
+            # M21WO4604CUTED-Datenblatt (Fs=27Hz, Qts=0.27, Vas=88.9L,
+            # 3 Treiber teilen sich ein Subgehaeuse -> Vas_eff=266.7L)
+            # und 154L Nettovolumen (100x53x37cm aussen, 19mm Wandstaerke,
+            # ~1L/Treiber Verdraengung geschaetzt):
+            # Fc=27*sqrt(1+266.7/154).
+            slope_db_oct: 12.0;
+            # Qtc=0.446 (deutlich <0.707, kein Resonanzueberhoehung) ->
+            # Auslenkung pro Volt faellt oberhalb Fc mit 12dB/Oktave
+            # (2-polig), ist unterhalb Fc naeherungsweise konstant/
+            # maximal. Die erlaubte Spannung vor Xmax steigt daher
+            # oberhalb Fc um denselben Betrag.
+            attack_ms: 1.0;
+            release_ms: 200.0;
+        };
+        limit: {
+            name: "amp_clip";
+            max_vrms: 52.89;
+            # 37.4Vrms (Sabaj Rated Output @350W/4R BTL) * sqrt(2) --
+            # Peak-Konvertierung, da "type: peak" gegen den Momentanwert
+            # prueft, der Rated-Output-Wert aber eine RMS-Leistungsangabe
+            # ist.
+            type: "peak";
+            attack_ms: 0.3;
+            release_ms: 200.0;
+        };
+        limit: {
+            name: "driver_thermal";
+            max_vrms: 37.9;
+            # Pe=80W/Treiber (deckt sich exakt mit "Power Handling 80W"
+            # im T+A/Vifa-Datenblatt), 2x3er-Serie/parallel-Topologie.
+            # type:"rms" -- schon korrekt RMS, keine Konvertierung noetig.
+            type: "rms";
+            window_ms: 500.0;
+            rms_release_ms: 2000.0;
+        };
+    };
+
+    # --- ESL-Gruppe: drei Checkpoints an drei verschiedenen Punkten
+    #     derselben Chain, ueber "stage" referenziert ---
+    group: {
+        channels: "esll", "eslr";
+        chain: "mytek_via_neutrik_tx";
+
+        limit: {
+            name: "transformer_saturation";
+            max_vrms: 0.7764;
+            # 0.549Vrms (-3dBu @ 50Hz, 1% THD lt. Datenblatt, vom Nutzer
+            # bestaetigt) * sqrt(2), Peak-Konvertierung s.o.
+            ref_freq_hz: 50.0;
+            slope_db_oct: 6.0;
+            # 1-polig: Kernsaettigung steigt linear mit der Frequenz
+            # (konstanter Fluss).
+            type: "peak";
+            attack_ms: 0.5;
+            release_ms: 300.0;
+            stage: 1;
+            # nur Stufe 1 (Neutrik) -- vor der TRI-Stufe und dem Step-up
+            # gemessen.
+        };
+        limit: {
+            name: "tri_rated_power";
+            max_vrms: 33.46;
+            # 23.66Vrms (70W/8R) * sqrt(2), Peak-Konvertierung s.o.
+            type: "peak";
+            attack_ms: 0.5;
+            release_ms: 300.0;
+            stage: 2;
+            # Stufe 1+2 (Neutrik+TRI) -- am TRI-Ausgang, vor dem Step-up.
+        };
+        limit: {
+            name: "els_xmax";
+            max_vrms: 2500.0;
+            # PRAGMATISCHE NAEHERUNG (nicht gemessen!): Bias-Spannung
+            # (~2.5kV) als praktische Obergrenze fuer den Stator-AC-Hub
+            # -- oberhalb der Bias-Spannung wird die Push-Pull-Feld-
+            # gleichung stark nichtlinear. Nutzer geht von +-4mm Hub aus,
+            # eine direkte mm->Volt-Herleitung braeuchte Spaltmass/
+            # Membransteifigkeit der Silberstatic NR2, die nicht bekannt
+            # sind. Spaeter per Messung praezisieren.
+            type: "peak";
+            attack_ms: 0.5;
+            release_ms: 300.0;
+            # kein "stage"-Feld -> volle Chain (Neutrik+TRI+Step-up, 66.6dB)
+        };
+    };
+};
