@@ -12,7 +12,8 @@ Xmax limit — and a single global limiter can't express any of that. This
 module lets you describe the actual physical signal chain instead, and
 have it compute the correct digital threshold for you.
 
-**Status: not yet validated against real hardware.** See
+**Status: live-deployed and used daily in a real system; absolute
+threshold accuracy not yet oscilloscope-verified.** See
 [Status](#status) below before relying on this for anything that can be
 damaged by a mistake.
 
@@ -157,6 +158,31 @@ logic: "protect" {
 Note: BruteFIR's config lexer only understands `#` line comments, no
 `/* */` block comments.
 
+### Runtime status via the CLI
+
+Once running, query live status over BruteFIR's own CLI. `lmc` accepts
+either the module's numeric index or its unquoted config name directly
+— no need to look up the index first:
+
+```
+lmc protect          # status table, idle checkpoints hidden
+lmc protect all      # status table, every checkpoint shown
+lmc protect json     # same data as a JSON array, for a webUI/script
+lmc protect reset    # zero every overs counter (gain/filter state untouched)
+```
+
+(The numeric form still works too — `lm` lists each logic module's
+current index, e.g. `1: "protect"` — but the index isn't stable across
+configs, so the name is usually less error-prone: `lmc 1`, `lmc 1 all`,
+etc.)
+
+The table/JSON both show, per checkpoint: `overs` (a raw per-sample
+count of how long the signal has been over threshold since the last
+reset or restart — also shown converted to milliseconds, since the raw
+count is easy to misread as "N separate incidents" rather than elapsed
+time) and `gain` (the current smoothed gain reduction, linear and in
+dB — `1.000`/`0.00dB` means no reduction right now).
+
 ## Testing
 
 `tests/` has a software-only dry-test setup: synthetic tones at known
@@ -181,10 +207,22 @@ with the module bypassed, as a reference point.
   against known expected levels — confirmed correct gain/threshold
   behavior for both peak and RMS checkpoints, frequency-weighted and
   not.
-- **Not yet validated against real hardware** (e.g. an oscilloscope
-  check of actual output voltage under a triggered limit). Treat any
-  config's computed thresholds as unverified until you've done that
-  check yourself.
+- **Live-deployed since 2026-08-27** on the real system
+  `examples/protect_example_config.txt` documents (see [Example
+  deployment](#example-deployment) below) — real listening confirms
+  limiting engages and releases as designed, at the levels the design
+  predicts (e.g. one real song example showed the step-up transformer's
+  saturation limit binding first, then the tube amp's own rated-power
+  limit, exactly matching the two checkpoints' predicted crossover
+  frequency).
+- **Absolute threshold accuracy not yet oscilloscope-verified** (a
+  direct scope check of the actual output voltage at the instant a
+  limit triggers, to confirm the computed `max_vrms` figures are
+  accurate in absolute terms, not just that the relative gain-reduction
+  behavior is correct). Real-world listening confirms the *behavior* is
+  right; it doesn't confirm every `max_vrms` figure is itself accurate.
+  Treat any config's computed thresholds accordingly until you've done
+  that check yourself.
 - Two real bugs were found and fixed during dry-testing, worth knowing
   about if you're auditing the source:
   1. Limit gain state initialized to `0.0` instead of `1.0`, causing a
@@ -194,10 +232,18 @@ with the module bypassed, as a reference point.
      (integer magnitude, not ±1.0-normalized) — without the fix, every
      real signal permanently collapses gain to zero regardless of
      level.
-- All example values in `examples/protect_example_config.txt` marked
-  "provisional" are estimates from public component data, not measured —
-  replace them with your own measured or manufacturer-confirmed values
-  before relying on them.
+- As of the 2026-08-27 redesign, every value in
+  `examples/protect_example_config.txt` is either directly measured
+  (REW THD sweeps) or calculated from real component datasheet
+  parameters — no remaining web-estimated/"provisional" values. Still
+  specific to one real system's hardware; don't copy the numbers
+  themselves into your own config, only the modeling approach.
+- **[0.0.2](https://github.com/MRinus/protect-bflogic/releases/tag/0.0.2)
+  added `lmc <idx>`/`all`/`json`/`reset` command modes** — an aligned
+  status table (idle checkpoints hidden by default), a JSON mode for a
+  webUI or other machine consumer, and a way to clear the `overs`
+  counters without a full BruteFIR restart. See [Config](#config)
+  below.
 
 ## Example deployment
 
