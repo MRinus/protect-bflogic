@@ -208,16 +208,26 @@ panels and two sealed woofer towers, crossed over in BruteFIR (90 Hz,
 meant for:
 
 - **Woofer chain** — one gain stage: BruteFIR → DAC (direct XLR) → a
-  Class-D amp in BTL mode. Three limits in one group: mechanical Xmax
-  (frequency-weighted, 2-pole above the sealed box's resonance), amp
-  clipping, and driver thermal (RMS).
-- **ESL chain** — three gain stages in series: DAC → a step-up/isolation
-  transformer → a tube amp's line input → the panel's own internal
-  step-up transformer to the stator. Three limits in one group, each
-  using `stage: N` to measure at a *different* point along that same
-  cascade: transformer saturation (frequency-weighted, right after
-  stage 1), the tube amp's rated power (after stage 2), and the panel's
-  own excursion limit (the full chain).
+  Class-D amp in BTL mode. Four limits in one group: a measured 2% THD
+  (audible-distortion) checkpoint, a *separate* calculated mechanical
+  Xmax backstop (frequency-weighted, 2-pole above the sealed box's
+  resonance, derived from the driver's real T-S parameters), amp
+  clipping, and driver thermal (RMS) — deliberately kept apart rather
+  than merged into one "xmax" value, since a THD criterion and a true
+  mechanical/hardware limit are different phenomena that happen to bind
+  at different levels.
+- **ESL chain** — three gain stages in series: DAC → a passive
+  balanced-to-unbalanced adapter (lossy, −6dB, *not* a transformer) → a
+  tube amp's line input → the panel's own internal step-up transformer
+  to the stator. Three limits in one group, each a distinct physical
+  mechanism rather than three views of the same event: the step-up
+  transformer's own core saturation (frequency-weighted, rises with
+  frequency — measured at the full chain, since that's where the
+  transformer's output sits), the tube amp's independent rated-power/
+  clipping ceiling (`stage: N`, frequency-*independent*, restored from
+  a datasheet value after an earlier revision briefly conflated it with
+  the transformer measurement above), and the panel's own excursion
+  safety backstop (full chain, unweighted).
 
 Note that this example reflects one point-in-time hardware
 configuration; it's included to show the config syntax and modeling

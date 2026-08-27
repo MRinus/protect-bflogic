@@ -4,21 +4,38 @@
 # "esll"/"eslr" (ESL panels) -- verified by grep against all six
 # configs, not guessed (2026-08-22).
 #
-# AS OF 2026-08-27, after a REW THD sweep measurement campaign and a
-# hardware change: the Neutrik NA2-TX 1:1 isolation transformer was
-# REMOVED from the ESL chain and replaced with a passive Neutrik NA2
-# FP-MF adapter plug (XLR female -> RCA/phono, wired per IEC 268-12,
-# pin 2 = signal, pins 1+3 = ground -- straight wiring, no
-# transformer, no saturation behaviour). Reason: no ground loop
-# present, and the tonal signature of the old transformer was
-# unwanted.
+# AS OF 2026-08-27 (updated same day, after a joint review of the
+# numbers below): a REW THD sweep measurement campaign plus a hardware
+# change (the Neutrik NA2-TX 1:1 isolation transformer was REMOVED from
+# the ESL chain and replaced with a passive Neutrik NA2 FP-MF adapter
+# plug, XLR female -> RCA/phono, wired per IEC 268-12, pin 2 = signal,
+# pins 1+3 = ground -- straight wiring, no transformer, no saturation
+# behaviour. Reason: no ground loop present, and the tonal signature of
+# the old transformer was unwanted) together surfaced three modeling
+# errors beyond a straight transcription of the campaign's raw numbers:
 #
-# All max_vrms values in the ESL group are now derived from real REW
-# THD sweeps (2% THD chosen as the hard ceiling, based on listening:
-# 3% already sounds audibly "broken" on this system), not from
-# datasheet/bias-voltage estimates. Woofer group: the xmax limit was
-# likewise updated from measurement; amp_clip/driver_thermal are
-# unchanged (outside the measured range, still datasheet values).
+# 1. The adapter is a balanced-to-single-ended conversion (cold leg
+#    tied to ground, not floated) -- it loses 6dB relative to the
+#    differential dac_max_output_vrms reference, not 0dB as first
+#    assumed. Correcting that also corrects the TRI's own gain (it
+#    must be 6dB higher than first computed, to still match the same
+#    measured output voltage).
+# 2. THD-based measurements had been used to REPLACE independent
+#    hardware-rated limits (amp clipping / rated power) instead of
+#    supplementing them -- losing a real, independent backstop in each
+#    case. Split back apart below.
+# 3. Two of the ESL limits ("tri_rated_power" at the time, and the
+#    step-up transformer limit) turned out to derive from the SAME
+#    single measurement event, just back-projected to two different
+#    points in the chain -- not two independent phenomena. Reverted
+#    tri_rated_power to its real, independent datasheet-derived value.
+#
+# All max_vrms values below are either directly measured (2026-08-27
+# REW THD sweeps, 2% THD chosen as the hard ceiling based on listening:
+# 3% already sounds audibly "broken" on this system) or calculated from
+# real component parameters (T-S parameters for the woofer's mechanical
+# Xmax) -- no remaining web-estimated/PROVISIONAL values in this
+# example.
 #
 # IMPORTANT: this lexer only understands "#" line comments, no /* */
 # block comments -- every line must start its own "#".
@@ -29,8 +46,8 @@ logic: "protect" {
     # BruteFIR's internal buffer at the output_timed() hook is NOT
     # normalised to +-1.0 for integer output formats (S32_LE, as used
     # by every real sqnt440<rate> config) -- it carries the raw
-    # integer magnitude. See the project's internal notes
-    # ("Software-Trockentest") for the full finding.
+    # integer magnitude. See this repo's README "Hook point" for the
+    # full finding.
 
     # --- Woofer chain: Sabaj A20a, direct XLR, BTL ---
     chain: "mytek_direct_xlr" {
@@ -41,9 +58,11 @@ logic: "protect" {
             # Sabaj A20a BTL voltage gain -- MEASURED (2026-08-27):
             # 4.686Vrms at the Sabaj output at -40dBFS (30Hz reference
             # point from the REW measurement campaign), back-derived
-            # against the DAC output voltage at that level. Replaces
-            # the old PROVISIONAL web-sourced estimate (38.8dB,
-            # difference -2.2dB).
+            # against the DAC output voltage. Replaces the old
+            # PROVISIONAL web-sourced estimate (38.8dB, difference
+            # -2.2dB). Requires the Sabaj's own volume control to
+            # stay fixed at maximum (user-confirmed) -- the module
+            # cannot verify/enforce that.
         };
     };
 
@@ -53,71 +72,103 @@ logic: "protect" {
     chain: "mytek_via_rca_adapter" {
         dac_max_output_vrms: 6.91;
         {
-            gain_db: 0.0;
+            gain_db: -6.0;
             # Stage 1: Neutrik NA2 FP-MF adapter plug (XLR female ->
             # RCA/phono, wired per IEC 268-12, pin 2 = signal, pins
-            # 1+3 = ground). Pure passive wiring, no transformer --
-            # no saturation behaviour, assumed loss/gain = 0dB. Correct
-            # here if it's ever measured to be otherwise.
-            #
-            # REPLACES the old Neutrik NA2-TX 1:1 isolation transformer
-            # (in the signal path until 2026-08-26) -- that component's
-            # own "transformer_saturation" checkpoint is therefore
-            # removed entirely (see group below).
+            # 1+3 = ground). CORRECTED same day (2026-08-27): this is
+            # a balanced-to-single-ended conversion -- the cold leg is
+            # tied to ground rather than left floating, which loses
+            # 6dB relative to the differential dac_max_output_vrms
+            # reference (that reference is explicitly the hot-to-cold
+            # DIFFERENTIAL voltage, per the Mytek calibration notes).
+            # Was first assumed lossless (gain_db: 0.0) -- wrong.
         };
         {
-            gain_db: 24.5;
-            # Stage 2: TRI 88 Signature Main-In gain -- MEASURED
-            # (2026-08-27): 8.52Vrms at the TRI output at -22.68dBFS/
-            # 80Hz (the 1% THD reference point from the REW measurement
-            # campaign), back-derived against the DAC output voltage.
-            # Now unambiguously attributable to the TRI alone, since
-            # stage 1 (the adapter) has no gain of its own -- previously
-            # (with the Neutrik transformer in the path) this figure
-            # was an inseparable Neutrik+TRI combination. Replaces the
-            # old PROVISIONAL web-sourced estimate (31.0dB).
+            gain_db: 30.5;
+            # Stage 2: TRI 88 Signature Main-In gain -- CORRECTED same
+            # day: originally computed as 24.5dB assuming stage 1 was
+            # 0dB (i.e. treating the full differential DAC voltage as
+            # what reaches the TRI's input). With the real -6dB
+            # adapter loss now accounted for, the real input voltage
+            # was half that, so the TRI's own gain must be 6dB higher
+            # to produce the same measured output (8.52Vrms at
+            # -22.68dBFS/80Hz, back-derived against DAC output
+            # voltage). The cumulative gain through this stage
+            # (-6.0+30.5=24.5dB) is unchanged from the original
+            # end-to-end measurement -- this was a bookkeeping-only
+            # correction, no threshold values changed because of it.
         };
         {
             gain_db: 35.6;
             # Stage 3: the ESL's own step-up transformer, 1:60 (user-
             # confirmed): 20*log10(60). Unchanged. The transformer is
-            # rated for ~100W itself -- its own saturation/thermal
-            # behaviour is deliberately not modelled (deferred at the
-            # user's request).
+            # rated for ~100W itself -- its own saturation is covered
+            # separately below (stepup_1_60_thd_2pct), not modeled as
+            # a fixed loss here.
         };
     };
 
-    # --- Woofer group ---
+    # --- Woofer group: two independent Xmax-type limits ---
     group: {
         channels: "subl", "subr";
         chain: "mytek_direct_xlr";
 
         limit: {
-            name: "xmax";
+            name: "driver_thd_2pct";
             max_vrms: 6.68;
-            # MEASURED (2026-08-27), REW THD sweep: the 2% THD point at
-            # 30Hz = -36.89dBFS -> 6.68Vrms at the Sabaj output (using
-            # the newly measured 36.6dB gain). 30Hz was more
-            # restrictive than 20Hz in the sweep (2% THD at 20Hz only
-            # reached at 12.68Vrms) -- taken as the conservative
-            # reference point. Replaces the old theoretical Xmax
-            # working value (20.0V, never measured). The root cause of
-            # the 30Hz > 20Hz asymmetry is still open (possibly driver
-            # nonlinearity or similar) -- not critical for the
-            # protection purpose, since the measured value is used
-            # directly, with no model assumption in between.
+            # RENAMED from "xmax" -- this is the MEASURED 2% THD point
+            # (REW sweep at 30Hz = 6.68Vrms at the Sabaj output, using
+            # the 36.6dB gain), an audible-distortion criterion, NOT
+            # the driver's actual mechanical excursion limit -- those
+            # were conflated under one "xmax" name/value before. A
+            # real, calculated mechanical Xmax limit now exists
+            # separately below. 30Hz was more restrictive than 20Hz in
+            # the sweep (2% THD at 20Hz only reached at 12.68V) -- taken
+            # as the conservative reference point; the 20Hz/30Hz
+            # asymmetry itself is still unexplained (possibly driver
+            # nonlinearity), not critical here since the measured value
+            # is used directly.
             type: "peak";
             ref_freq_hz: 39.04;
             slope_db_oct: 12.0;
-            # Sealed-box Fc -- CORRECTED (2026-08-27): the driver is a
-            # Vifa/Scan-Speak PL22WR09-08 (8 ohm), NOT the
-            # M21WO4604CUTED previously assumed. Vas=56L (instead of
-            # 88.9L) -> Vas_eff=168L (3 drivers sharing one enclosure)
-            # instead of 266.7L; with the same 154L net volume:
-            # Fc=27*sqrt(1+168/154)=39.04Hz (instead of 44.6Hz),
-            # Qtc=0.492 (instead of 0.446, still well under 0.707, no
-            # resonance peak). The frequency-weighting structure
-            # (12dB/octave) remains valid, only the anchor point moved.
+            # Sealed-box Fc: the driver is a Vifa/Scan-Speak
+            # PL22WR09-08 (8 ohm). Vas=56L -> Vas_eff=168L (3 drivers
+            # sharing one enclosure) with 154L net volume:
+            # Fc=27*sqrt(1+168/154)=39.04Hz, Qtc=0.492 (well under
+            # 0.707, no resonance peak). Same anchor/slope used for the
+            # calculated mechanical xmax limit below -- kept as-is for
+            # this THD criterion too rather than re-derived separately.
+            attack_ms: 1.0;
+            release_ms: 200.0;
+        };
+        limit: {
+            name: "xmax";
+            max_vrms: 16.80;
+            # NEW: the real mechanical excursion limit, CALCULATED (not
+            # measured) from the PL22WR09-08's actual T-S parameters
+            # (Bl=10.9Tm, Re=5.9ohm, Mms=43g, fs=27Hz -- from the
+            # manufacturer datasheet) and Xmax=+-4mm (16mm voice coil
+            # height - 8mm gap height, /2 -- standard linear-excursion
+            # formula for an overhung coil, user-confirmed). Low-
+            # frequency excursion sensitivity (well below system Fc,
+            # stiffness-controlled region): x/V = Bl/(Re*Mms*wc^2),
+            # wc=2*pi*39.04Hz -> 0.714mm/V per driver -> 4mm/0.714 =
+            # 5.60Vpk at a single driver's own terminals. The array is
+            # 3 drivers wired IN SERIES per side (user-confirmed) ->
+            # each driver sees 1/3 of the Sabaj output voltage ->
+            # 3*5.60=16.80Vpk at the amp output. Cross-checked: Qes
+            # computed from these same Bl/Re/Mms/fs values (0.362)
+            # matches the datasheet Qes (0.37). Sits ABOVE the measured
+            # driver_thd_2pct (6.68V) -- confirms the THD criterion is
+            # the practically-binding one, this is a genuine,
+            # less-restrictive hardware backstop.
+            type: "peak";
+            ref_freq_hz: 39.04;
+            slope_db_oct: 12.0;
+            # Same Fc/slope as driver_thd_2pct -- theoretically exact
+            # here (mass-controlled roll-off above Fc, |X/V| falls as
+            # 1/f^2 -> allowed voltage for a fixed Xmax rises 12dB/oct
+            # above Fc).
             attack_ms: 1.0;
             release_ms: 200.0;
         };
@@ -125,10 +176,9 @@ logic: "protect" {
             name: "amp_clip";
             max_vrms: 52.89;
             # UNCHANGED -- 37.4Vrms (Sabaj rated output @350W/4R BTL)
-            # * sqrt(2). Outside the measured range (30Hz/2% THD sits
-            # at 6.68V, far below) -- the amp's own rating is
-            # demonstrably not the limiting factor, no new measurement
-            # needed.
+            # * sqrt(2). Sits well above both Xmax-type limits above --
+            # the amp's own rating is demonstrably not the limiting
+            # factor, no new measurement needed.
             type: "peak";
             attack_ms: 0.3;
             release_ms: 200.0;
@@ -136,67 +186,95 @@ logic: "protect" {
         limit: {
             name: "driver_thermal";
             max_vrms: 37.9;
-            # UNCHANGED, BUT TECHNICALLY STALE (2026-08-27): with the
-            # correct driver (PL22WR09-08, Pe=125W nominal/350W
-            # long-term instead of the old incorrect 80W assumption)
-            # this value should properly be higher. Deliberately not
-            # recalculated because it's moot: the real 2% THD point
-            # (6.68V, see "xmax" above) sits so far below it that the
-            # thermal limit never engages either way -- the THD
-            # criterion is the actually binding factor, not
-            # temperature. Only worth recalculating if the xmax limit
-            # is ever relaxed later.
+            # UNCHANGED, BUT TECHNICALLY STALE: with the correct driver
+            # (PL22WR09-08, 350W long-term max power per its datasheet,
+            # instead of the old incorrect 80W assumption) this value
+            # should properly be higher. Deliberately not recalculated
+            # because it's moot: both Xmax-type limits above sit so far
+            # below it that the thermal limit never engages either way.
+            # Only worth recalculating if those are ever relaxed.
             type: "rms";
             window_ms: 500.0;
             rms_release_ms: 2000.0;
         };
     };
 
-    # --- ESL group: only TWO checkpoints now (transformer_saturation
-    #     removed, since the Neutrik transformer is no longer in the
-    #     signal path) ---
+    # --- ESL group: three independent checkpoints, each a distinct
+    #     physical mechanism ---
     group: {
         channels: "esll", "eslr";
         chain: "mytek_via_rca_adapter";
 
+        # No transformer_saturation limit here: it used to check the
+        # voltage right at the (now physically removed) Neutrik
+        # isolation transformer -- see the chain comment above. The
+        # ESL's OWN step-up transformer's saturation is covered
+        # separately below (stepup_1_60_thd_2pct), not this one.
+
+        limit: {
+            name: "stepup_1_60_thd_2pct";
+            max_vrms: 971.0;
+            # RENAMED from "els_xmax" -- MEASURED (REW THD sweep, full
+            # chain): the 2% THD point at 80Hz = 971V at the stator
+            # (using 60.1dB total chain gain: -6.0dB adapter + 30.5dB
+            # TRI + 35.6dB own step-up). 80Hz was the most restrictive
+            # point across the full sweep (80-300Hz) -- 130Hz already
+            # allows 1503V.
+            type: "peak";
+            ref_freq_hz: 80.0;
+            slope_db_oct: 6.0;
+            # NEWLY frequency-weighted (was flat before): the ceiling
+            # RISING with frequency (971V@80Hz -> 1503V@130Hz, implying
+            # ~5.4dB/oct from those two points, close to the
+            # theoretical 1-pole 6dB/oct core-saturation model --
+            # rounded to 6.0 here) is the classic signature of
+            # transformer core saturation (flux ~ V/f), NOT a
+            # diaphragm/panel excursion limit -- this is the ESL's own
+            # 1:60 step-up transformer saturating, not the panel
+            # itself. Recovers headroom above 80Hz that a flat,
+            # worst-case-anchored limit would leave unused.
+            attack_ms: 0.5;
+            release_ms: 300.0;
+        };
         limit: {
             name: "tri_rated_power";
-            max_vrms: 16.19;
-            # MEASURED (2026-08-27): the 2% THD point at 80Hz (worst
-            # case vs. 130Hz, where it's 25.04V) = -17.1dBFS -> 16.19V
-            # at the TRI output, using the newly measured 24.5dB chain
-            # gain. Replaces the old datasheet value (33.46V, from the
-            # 70W/8R rating) -- the TRI itself still has plenty of
-            # power headroom at this level; the THD criterion engages
-            # well before the amp's own rating would.
+            max_vrms: 33.46;
+            # RESTORED to the original datasheet-derived value (70W/8R
+            # rating). A measured 16.19V THD value briefly replaced
+            # this and was a mistake: it and stepup_1_60_thd_2pct above
+            # both come from the SAME single 2% THD @ 80Hz measurement
+            # event, just back-projected to two different chain points
+            # (stage 2 vs. full chain) -- since the frequency-rising-
+            # with-headroom pattern points to the step-up transformer
+            # as the real cause, that single event isn't an independent
+            # TRI-specific limit at all. This restores TRI's own
+            # genuine, gain-independent hardware ceiling (rated power /
+            # internal clipping) as a real, separate backstop --
+            # deliberately not frequency-weighted (no frequency
+            # dependence assumed for amplifier clipping).
             type: "peak";
             attack_ms: 0.5;
             release_ms: 300.0;
             stage: 2;
             # Stage 1+2 (adapter+TRI) -- measured at the TRI output,
-            # before the step-up.
+            # before the step-up. (Historical note: this was
+            # temporarily "stage: 1" for a short window on 2026-08-25,
+            # back when the removed Neutrik stage was simply omitted
+            # rather than modeled as an explicit 0dB/-6dB stage 1 --
+            # see the chain comment above for the current 3-stage
+            # structure.)
         };
         limit: {
             name: "els_xmax";
-            max_vrms: 971.0;
-            # MEASURED (2026-08-27), REW THD sweep, full chain: the 2%
-            # THD point at 80Hz = -17.1dBFS -> 971V at the stator
-            # (using 60.1dB total chain gain: 24.5dB adapter+TRI +
-            # 35.6dB own step-up). 80Hz was the most restrictive point
-            # across the full sweep (80-300Hz) -- 130Hz already allows
-            # 1503V, and 200Hz is even less critical (per the user's
-            # direct listening assessment, not separately measured).
-            # The behaviour (ceiling RISING with frequency) points to
-            # core saturation somewhere in the chain, not a diaphragm
-            # excursion limit -- accordingly deliberately NOT
-            # frequency-weighted, but set as a flat value at the worst
-            # measured point (80Hz): conservative and safe, even though
-            # it leaves headroom unused at 130Hz and above.
-            #
-            # Replaces the old bias-voltage placeholder (2500V,
-            # explicitly marked "not measured, pragmatic
-            # approximation") -- the real value is only about 39% of
-            # that.
+            max_vrms: 2500.0;
+            # Panel's own hard safety backstop -- bias voltage (~2.5kV)
+            # as a practical ceiling for the stator AC swing, NOT
+            # measured. User assumes +-4mm excursion; a direct mm->volt
+            # derivation would need the panel's gap dimension/diaphragm
+            # stiffness, which aren't known -- precise later via
+            # measurement. Deliberately NOT frequency-weighted, unlike
+            # stepup_1_60_thd_2pct above (this is a hard electrical
+            # ceiling, not a frequency-dependent saturation effect).
             type: "peak";
             attack_ms: 0.5;
             release_ms: 300.0;
