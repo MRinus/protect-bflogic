@@ -185,14 +185,24 @@ logic: "protect" {
         };
         limit: {
             name: "driver_thermal";
-            max_vrms: 37.9;
-            # UNCHANGED, BUT TECHNICALLY STALE: with the correct driver
-            # (PL22WR09-08, 350W long-term max power per its datasheet,
-            # instead of the old incorrect 80W assumption) this value
-            # should properly be higher. Deliberately not recalculated
-            # because it's moot: both Xmax-type limits above sit so far
-            # below it that the thermal limit never engages either way.
-            # Only worth recalculating if those are ever relaxed.
+            max_vrms: 136.33;
+            # RECALCULATED with the PL22WR09-08's real datasheet values
+            # (Re=5.9ohm, Long-term Max Power per IEC 18.3 = 350W per
+            # driver) and the real 3-drivers-in-series topology per
+            # side (same values already used for the calculated
+            # mechanical xmax limit above). The same current flows
+            # through all 3 identical series drivers, so all reach
+            # their thermal limit together: V_per_driver = sqrt(Pe*Re)
+            # = sqrt(350*5.9) = 45.44Vrms; array voltage (the measured
+            # point, at the Sabaj output) = 3*45.44 = 136.33Vrms. Was
+            # 37.9V (stale, calculated for the old, wrong 6-driver
+            # M21WO4604CUTED topology -- a different physical
+            # arrangement entirely, not just a different Pe number).
+            # Effectively unreachable in practice: amp_clip's 52.89Vpk
+            # (37.4Vrms) is the amp's own hard output ceiling, far
+            # below this -- driver_thermal is now a correctly-
+            # calculated, generously-high true hardware backstop rather
+            # than a plausibly-wrong stale guess.
             type: "rms";
             window_ms: 500.0;
             rms_release_ms: 2000.0;
