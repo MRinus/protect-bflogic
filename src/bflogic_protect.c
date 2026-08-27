@@ -60,6 +60,7 @@
  */
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <math.h>
 
@@ -164,7 +165,16 @@ static double output_scale = 2147483647.0;
 static int sample_rate;
 static int block_length;
 static int realsize;
-static char msg[1024];
+/* Sized for the theoretical worst case (MAX_GROUPS * MAX_CH_PER_GROUP *
+   MAX_LIMITS_PER_GROUP = 8*4*8 = 256 limit-states), not just the current
+   live config's 14 -- the "json"/"all" bflogic_command() output modes
+   below are one line/object per limit-state, and bflogic_command() used
+   to write into a bare 1024-byte buffer with unchecked sprintf(), which
+   would have silently overflowed on a larger config even before these
+   modes existed. All writes below go through snprintf() with remaining-
+   space tracking, so this is a hard ceiling, not just headroom. */
+#define MSG_BUF_SIZE 65536
+static char msg[MSG_BUF_SIZE];
 
 #define MAX_MAPPED_CHANNELS 64
 static int chan_group[MAX_MAPPED_CHANNELS];
@@ -732,21 +742,159 @@ bflogic_init(struct bfaccess *bfaccess,
     return 0;
 }
 
+/* "active" for display-filtering purposes: has ever pulled gain down
+   (recorded overs) or is pulling it down right now. Same 0.999
+   threshold process_channel() itself uses to decide whether a sample
+   counts as an "over" -- see the "if (target < 0.999) ls->overs++;"
+   calls above. */
+static inline int
+limit_state_active(struct limit_state *ls)
+{
+    return ls->overs > 0 || ls->gain < 0.999;
+}
+
+static inline double
+gain_to_db(double gain)
+{
+    /* gain is a smoothed target/gain ratio, always in (0, 1] by
+       construction -- floor it before log10() only to guard against
+       a theoretical exact 0.0 at startup before the first sample. */
+    return 20.0 * log10(gain > 1e-12 ? gain : 1e-12);
+}
+
+static inline double
+overs_to_ms(long overs)
+{
+    return (sample_rate > 0) ? (1000.0 * (double)overs / sample_rate) : 0.0;
+}
+
+/* Appends at most `remaining` bytes (incl. terminator) via snprintf,
+   then advances the write pointer and remaining-space count by however
+   much was actually written -- never past the buffer, unlike the old
+   unchecked sprintf() this replaces. Silently truncates once the
+   buffer fills, same as any snprintf-based accumulator. */
+static void
+msg_append(char **p, size_t *remaining, const char *fmt, ...)
+{
+    if (*remaining == 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(*p, *remaining, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    size_t written = ((size_t)n < *remaining) ? (size_t)n : *remaining - 1;
+    *p += written;
+    *remaining -= written;
+}
+
+/* lmc 1 <params> (BruteFIR CLI) - "1" is whatever `lm` currently shows
+   as the protect module's index, not a stable/hardcoded number.
+     (no params) / "status" -- table, idle limit-states hidden
+     "all"                  -- table, every limit-state shown
+     "json"                 -- JSON array, every limit-state, for a
+                                webUI/machine consumer
+     "reset"                -- zero every overs counter (does NOT touch
+                                gain/shelf filter state - a limit still
+                                actively reducing gain when reset is
+                                called keeps doing so; reset only clears
+                                the historical counter) */
 int
 bflogic_command(const char params[])
 {
     char *p = msg;
+    size_t remaining = MSG_BUF_SIZE;
     memset(msg, 0, sizeof(msg));
-    for (int g = 0; g < n_groups; g++) {
-        for (int c = 0; c < groups[g].n_channels; c++) {
-            for (int l = 0; l < groups[g].n_limits; l++) {
-                p += sprintf(p, "grp%d/%s/%s: overs=%ld gain=%.3f\n",
-                             g, groups[g].ch_names[c],
-                             groups[g].limits[l].name,
-                             ch_runtime[g][c].st[l].overs,
-                             ch_runtime[g][c].st[l].gain);
+
+    while (*params == ' ' || *params == '\t') params++;
+
+    if (strncmp(params, "reset", 5) == 0) {
+        int count = 0;
+        for (int g = 0; g < n_groups; g++)
+            for (int c = 0; c < groups[g].n_channels; c++)
+                for (int l = 0; l < groups[g].n_limits; l++) {
+                    ch_runtime[g][c].st[l].overs = 0;
+                    count++;
+                }
+        msg_append(&p, &remaining,
+                   "PROTECT: overs counters reset (%d limit checkpoints)\n",
+                   count);
+        return 0;
+    }
+
+    int as_json = (strncmp(params, "json", 4) == 0);
+    int show_all = as_json || (strncmp(params, "all", 3) == 0);
+
+    if (as_json) {
+        msg_append(&p, &remaining, "[\n");
+        int first = 1;
+        for (int g = 0; g < n_groups; g++) {
+            struct group *gr = &groups[g];
+            const char *chain_name =
+                (gr->chain_index >= 0) ? chains[gr->chain_index].name : "";
+            for (int c = 0; c < gr->n_channels; c++) {
+                for (int l = 0; l < gr->n_limits; l++) {
+                    struct limit_state *ls = &ch_runtime[g][c].st[l];
+                    msg_append(&p, &remaining,
+                        "%s{\"group\":%d,\"chain\":\"%s\",\"channel\":\"%s\","
+                        "\"limit\":\"%s\",\"type\":\"%s\",\"overs\":%ld,"
+                        "\"overs_ms\":%.1f,\"gain\":%.4f,\"gain_db\":%.2f}",
+                        first ? "" : ",\n",
+                        g, chain_name, gr->ch_names[c], gr->limits[l].name,
+                        (gr->limits[l].type == LIMIT_RMS) ? "rms" : "peak",
+                        ls->overs, overs_to_ms(ls->overs), ls->gain,
+                        gain_to_db(ls->gain));
+                    first = 0;
+                }
             }
         }
+        msg_append(&p, &remaining, "\n]\n");
+        return 0;
+    }
+
+    /* table (default "status", and "all") */
+    int total = 0, with_overs = 0, reducing = 0;
+    for (int g = 0; g < n_groups; g++)
+        for (int c = 0; c < groups[g].n_channels; c++)
+            for (int l = 0; l < groups[g].n_limits; l++) {
+                struct limit_state *ls = &ch_runtime[g][c].st[l];
+                total++;
+                if (ls->overs > 0) with_overs++;
+                if (ls->gain < 0.999) reducing++;
+            }
+    msg_append(&p, &remaining,
+               "PROTECT: %d limits, %d with recorded overs, "
+               "%d currently reducing gain\n\n",
+               total, with_overs, reducing);
+    msg_append(&p, &remaining, "%-5s  %-4s  %-22s  %6s  %8s  %6s  %7s\n",
+               "GROUP", "CHAN", "LIMIT", "OVERS", "TIME", "GAIN", "dB");
+
+    int hidden = 0;
+    for (int g = 0; g < n_groups; g++) {
+        struct group *gr = &groups[g];
+        for (int c = 0; c < gr->n_channels; c++) {
+            for (int l = 0; l < gr->n_limits; l++) {
+                struct limit_state *ls = &ch_runtime[g][c].st[l];
+                if (!show_all && !limit_state_active(ls)) {
+                    hidden++;
+                    continue;
+                }
+                char grpbuf[8], timebuf[16];
+                snprintf(grpbuf, sizeof(grpbuf), "grp%d", g);
+                snprintf(timebuf, sizeof(timebuf), "%.1fms",
+                         overs_to_ms(ls->overs));
+                msg_append(&p, &remaining,
+                           "%-5s  %-4s  %-22s  %6ld  %8s  %6.3f  %7.2f\n",
+                           grpbuf, gr->ch_names[c], gr->limits[l].name,
+                           ls->overs, timebuf, ls->gain, gain_to_db(ls->gain));
+            }
+        }
+    }
+    if (!show_all && hidden > 0) {
+        msg_append(&p, &remaining,
+                   "\n(%d idle limit%s hidden - \"lmc <idx> all\" for "
+                   "everything, \"lmc <idx> json\" for machine-readable "
+                   "output)\n",
+                   hidden, hidden == 1 ? "" : "s");
     }
     return 0;
 }
