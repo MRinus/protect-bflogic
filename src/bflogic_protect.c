@@ -109,6 +109,14 @@ struct limit_cfg {
     /* 0 = volle Chain-Verstaerkung; sonst: nur die ersten `stage`
        Stufen der Chain summieren (1-indiziert), s.o. */
     int    stage;
+    /* v3: Gewichtung VOR dem Betrag (1) statt dahinter (0, Altverhalten).
+       Nur mit freq_weighted wirksam. Siehe Kommentar in process_channel(). */
+    int    signed_weight;
+    /* v3: zur Laufzeit per "lmc <idx> on|off <name>" schaltbar. 0 = der
+       Checkpoint wird uebersprungen (Gain 1.0). always_on = 1 verbietet
+       das Ausschalten (Verstaerker-Clip, Thermik). */
+    volatile int enabled;
+    int    always_on;
 };
 
 struct group {
@@ -263,6 +271,8 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
     double ref_freq_hz = 0.0, slope_db_oct = 0.0;
     int stage = 0;
     char type_str[32] = "peak";
+    char weighting_str[16] = "abs";
+    int enabled = 1, always_on = 0;
 
     memset(l, 0, sizeof(*l));
 
@@ -312,6 +322,21 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
             GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
             stage = (int)(lexval.real + 0.5);
             GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
+        } else if (strcmp(lexval.field, "weighting") == 0) {
+            /* "abs"    = Altverhalten: erst Betrag, dann Tiefpaesse
+               "signed" = erst Tiefpaesse auf das vorzeichenbehaftete
+                          Signal, dann Betrag (v3, physikalisch korrekt) */
+            GET_TOKEN(BF_LEXVAL_STRING, "expected string.\n");
+            strncpy(weighting_str, lexval.string, sizeof(weighting_str) - 1);
+            GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
+        } else if (strcmp(lexval.field, "enabled") == 0) {
+            GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
+            enabled = (lexval.real != 0.0);
+            GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
+        } else if (strcmp(lexval.field, "always_on") == 0) {
+            GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
+            always_on = (lexval.real != 0.0);
+            GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
         } else {
             fprintf(stderr, "PROTECT: limit: unknown field '%s'.\n",
                     lexval.field);
@@ -326,6 +351,21 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
     if (stage < 0) {
         fprintf(stderr, "PROTECT: limit '%s': stage must be >= 1 (or "
                 "omitted for the full chain), got %d.\n", l->name, stage);
+        return -1;
+    }
+    if (strcmp(weighting_str, "abs") != 0 &&
+        strcmp(weighting_str, "signed") != 0)
+    {
+        fprintf(stderr, "PROTECT: limit '%s': weighting must be \"abs\" or "
+                "\"signed\", got '%s'.\n", l->name, weighting_str);
+        return -1;
+    }
+    l->signed_weight = (strcmp(weighting_str, "signed") == 0);
+    l->enabled = enabled;
+    l->always_on = always_on;
+    if (always_on && !enabled) {
+        fprintf(stderr, "PROTECT: limit '%s': always_on with enabled: 0 "
+                "makes no sense.\n", l->name);
         return -1;
     }
     l->stage = stage;
@@ -363,6 +403,11 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
            Oktave (z.B. Trafo-Kernsaettigung), 2 Stufen = 12dB/Oktave
            (z.B. Xmax einer geschlossenen Box unterhalb/oberhalb Fc). */
         l->shelf_coeff = exp(-2.0 * M_PI * ref_freq_hz / sample_rate);
+    }
+    if (l->signed_weight && !l->freq_weighted) {
+        fprintf(stderr, "PROTECT: limit '%s': weighting \"signed\" needs "
+                "ref_freq_hz and slope_db_oct.\n", l->name);
+        return -1;
     }
     return 0;
 }
@@ -503,7 +548,31 @@ process_channel(struct group *g, int gi, int ci, double *samples, int n)
             struct limit_state *ls = &rt->st[l];
             double detect_mag = mag;
 
-            if (lc->freq_weighted) {
+            if (!lc->enabled) {          /* v3: per Kommando abgeschaltet */
+                ls->gain = 1.0;
+                continue;
+            }
+
+            if (lc->freq_weighted && lc->signed_weight) {
+                /* v3: Tiefpass-Kaskade auf das VORZEICHENBEHAFTETE Signal,
+                   danach Betrag. Das ist die Uebertragungsfunktion
+                   Spannung -> Membranauslenkung einer geschlossenen Box
+                   (2 gleiche Einpol-Tiefpaesse = Q 0,5, Qtc der Box 0,49):
+                   die zulaessige Spitzenspannung ist max_vrms*(1+(f/fc)^2).
+                   Im Altpfad (erst fabs, dann Tiefpass) bleibt der
+                   Gleichanteil des gleichgerichteten Signals ungedaempft
+                   und die Gewichtung wirkt nur bei sehr tiefen
+                   Frequenzen. */
+                ls->shelf_z1 = (1.0 - lc->shelf_coeff) * s +
+                                lc->shelf_coeff * ls->shelf_z1;
+                detect_mag = ls->shelf_z1;
+                if (lc->shelf_poles == 2) {
+                    ls->shelf_z2 = (1.0 - lc->shelf_coeff) * detect_mag +
+                                    lc->shelf_coeff * ls->shelf_z2;
+                    detect_mag = ls->shelf_z2;
+                }
+                detect_mag = fabs(detect_mag);
+            } else if (lc->freq_weighted) {
                 /* Kaskade von Einpol-Tiefpaessen (shelf_poles Stufen,
                    gleiche Eckfrequenz) auf den Detektor-Eingang dieses
                    Checkpoints, bildet die mit der Frequenz steigende
@@ -789,6 +858,13 @@ msg_append(char **p, size_t *remaining, const char *fmt, ...)
 
 /* lmc 1 <params> (BruteFIR CLI) - "1" is whatever `lm` currently shows
    as the protect module's index, not a stable/hardcoded number.
+   v3 additions:
+     "list"                 -- all limits: ON/off, type, weighting, threshold
+     "on <name>|all"        -- enable a limit (state is cleared first)
+     "off <name>|all"       -- disable a limit; refused for always_on limits
+                                and for the last enabled non-always_on limit
+                                of a group (so the Xmax/THD protection can
+                                never be switched off completely)
      (no params) / "status" -- table, idle limit-states hidden
      "all"                  -- table, every limit-state shown
      "json"                 -- JSON array, every limit-state, for a
@@ -806,6 +882,73 @@ bflogic_command(const char params[])
     memset(msg, 0, sizeof(msg));
 
     while (*params == ' ' || *params == '\t') params++;
+
+    /* v3: "list" | "on <name>|all" | "off <name>|all" */
+    if (strncmp(params, "list", 4) == 0) {
+        msg_append(&p, &remaining, "%-5s  %-22s  %-5s  %-6s  %-8s  %s\n",
+                   "GROUP", "LIMIT", "STATE", "TYPE", "WEIGHT", "THRESHOLD");
+        for (int g = 0; g < n_groups; g++)
+            for (int l = 0; l < groups[g].n_limits; l++) {
+                struct limit_cfg *lc = &groups[g].limits[l];
+                msg_append(&p, &remaining,
+                    "grp%-2d  %-22s  %-5s  %-6s  %-8s  %.2f dBFS%s\n", g,
+                    lc->name, lc->enabled ? "ON" : "off",
+                    lc->type == LIMIT_RMS ? "rms" : "peak",
+                    !lc->freq_weighted ? "-" :
+                        (lc->signed_weight ? "signed" : "abs"),
+                    20.0 * log10(lc->threshold_lin / output_scale),
+                    lc->always_on ? "  (always_on)" : "");
+            }
+        return 0;
+    }
+    if (strncmp(params, "on ", 3) == 0 || strncmp(params, "off ", 4) == 0) {
+        int turn_on = (params[1] == 'n');
+        const char *name = params + (turn_on ? 3 : 4);
+        while (*name == ' ') name++;
+        char nm[BF_MAXOBJECTNAME];
+        size_t k = 0;
+        while (name[k] && name[k] != ' ' && name[k] != '\n' &&
+               name[k] != '\r' && k < sizeof(nm) - 1)
+        {
+            nm[k] = name[k]; k++;
+        }
+        nm[k] = 0;
+        int all = (strcmp(nm, "all") == 0), hit = 0, refused = 0;
+        for (int g = 0; g < n_groups; g++) {
+            for (int l = 0; l < groups[g].n_limits; l++) {
+                struct limit_cfg *lc = &groups[g].limits[l];
+                if (!all && strcmp(lc->name, nm) != 0) continue;
+                if (!turn_on) {
+                    /* mindestens ein NICHT-always_on-Limit (Xmax/THD)
+                       muss aktiv bleiben, sonst laeuft die Gruppe nur
+                       noch mit Verstaerker-Clip und Thermik */
+                    int others = 0;
+                    for (int m = 0; m < groups[g].n_limits; m++)
+                        if (m != l && groups[g].limits[m].enabled &&
+                            !groups[g].limits[m].always_on) others++;
+                    if (lc->always_on || others == 0) {
+                        refused++;
+                        continue;      /* nie die letzte Absicherung weg */
+                    }
+                    lc->enabled = 0;
+                } else if (!lc->enabled) {
+                    for (int c = 0; c < groups[g].n_channels; c++) {
+                        struct limit_state *ls = &ch_runtime[g][c].st[l];
+                        ls->shelf_z1 = ls->shelf_z2 = 0.0;
+                        ls->rms_sumsq = 0.0;
+                        ls->gain = 1.0;
+                    }
+                    lc->enabled = 1;
+                }
+                hit++;
+            }
+        }
+        msg_append(&p, &remaining, "PROTECT: %s '%s': %d limit(s) changed, "
+                   "%d refused (always_on or last Xmax/THD limit of its "
+                   "group), %s\n", turn_on ? "on" : "off", nm, hit, refused,
+                   (hit + refused) ? "see \"list\"" : "name not found");
+        return 0;
+    }
 
     if (strncmp(params, "reset", 5) == 0) {
         int count = 0;
@@ -883,9 +1026,10 @@ bflogic_command(const char params[])
                 snprintf(timebuf, sizeof(timebuf), "%.1fms",
                          overs_to_ms(ls->overs));
                 msg_append(&p, &remaining,
-                           "%-5s  %-4s  %-22s  %6ld  %8s  %6.3f  %7.2f\n",
+                           "%-5s  %-4s  %-22s  %6ld  %8s  %6.3f  %7.2f%s\n",
                            grpbuf, gr->ch_names[c], gr->limits[l].name,
-                           ls->overs, timebuf, ls->gain, gain_to_db(ls->gain));
+                           ls->overs, timebuf, ls->gain, gain_to_db(ls->gain),
+                           gr->limits[l].enabled ? "" : "  OFF");
             }
         }
     }
