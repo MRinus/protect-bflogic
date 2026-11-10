@@ -1,5 +1,30 @@
 /*
- * bflogic_protect.c  (v2 -- generalized signal-chain model)
+ * bflogic_protect.c  (v3 -- generalized signal-chain model, + channel link)
+ *
+ * CHANNEL LINK (dev-2, 08.11.2026, design "protect Channel-Link Design
+ * (08.11.2026)", architect 8a51a27, stage 1):
+ *
+ *   link: "<name>" { channels: "a", "b", ...;     2..MAX_CH_PER_LINK
+ *                    [drive: "a", ...;]           subset, default: all
+ *                    [ratio: r_a, r_b, ...;]      0..1 per member, default 1
+ *                    [offset_db: o_a, ...;]       0..40 per member, default 0
+ *                    [enabled: 1;] };
+ *
+ * Every member keeps its own limits exactly as before. Additionally it
+ * follows the reduction of the driving partners of its link:
+ *   follow_dB = ratio_me * max(0, A_partner_dB - offset_me),
+ *   applied gain = min(own combined gain, 10^(-max follow_dB / 20)).
+ * A link therefore never raises a gain (invariant |y_link| <= |y_nolink|
+ * per sample, test T1a). The partner value is the minimum OWN gain of the
+ * partner's PREVIOUS block, published lock-free in two parity slots per
+ * channel; BruteFIR's per-block barrier between filter threads
+ * (bfrun.c synch_filter_processes) orders the write before the read. The
+ * follower ramps linearly from its previous link gain to the new one over
+ * the block (no steps at block boundaries). Without a link block the
+ * processing path is the unchanged v3 code (test T1b, bit-identical).
+ * Config errors (unknown/duplicate names, member without group, channel in
+ * two groups or two links, ratio/offset out of range, ...) make preinit
+ * return -1 -> BruteFIR exits with BF_EXIT_INVALID_CONFIG (fail-safe).
  *
  * Ersetzt die fest vorgerechneten dBFS-Schwellen aus v1 durch eine
  * deklarative Beschreibung der realen Signalkette. Nichts wird mehr
@@ -187,6 +212,58 @@ static char msg[MSG_BUF_SIZE];
 #define MAX_MAPPED_CHANNELS 64
 static int chan_group[MAX_MAPPED_CHANNELS];
 static int chan_idx[MAX_MAPPED_CHANNELS];
+
+/* ---- Channel link (stage 1) -------------------------------------------- */
+
+#define MAX_LINKS        4
+#define MAX_CH_PER_LINK  8
+#define LINK_RATIO_MAX   1.0
+#define LINK_OFFSET_MAX  40.0
+
+struct link_cfg {                          /* written in preinit only */
+    char   name[BF_MAXOBJECTNAME];
+    int    n;                              /* members */
+    char   member_name[MAX_CH_PER_LINK][BF_MAXOBJECTNAME];
+    int    member_ch[MAX_CH_PER_LINK];     /* BruteFIR intname */
+    int    n_drive;                        /* 0 = field absent -> all drive */
+    char   drive_name[MAX_CH_PER_LINK][BF_MAXOBJECTNAME];
+    int    drives[MAX_CH_PER_LINK];        /* 0/1, resolved */
+    int    n_ratio, n_offset;              /* 0 = field absent -> defaults */
+    double ratio[MAX_CH_PER_LINK];         /* [0,1] */
+    double offset_db[MAX_CH_PER_LINK];     /* [0,40] */
+    int    enabled;                        /* atomic access only (lmc thread) */
+};
+
+struct pub_slot {                          /* 2 per channel (block parity) */
+    double gmin;                           /* minimum OWN gain in the block */
+    long   blk;                            /* block number of the writer */
+} __attribute__((aligned(64)));            /* one cache line each, no false sharing */
+
+static struct link_cfg links[MAX_LINKS];
+static int    n_links = 0;
+static int    chan_link[MAX_MAPPED_CHANNELS];     /* -1 = in no link */
+static int    chan_member[MAX_MAPPED_CHANNELS];   /* index within the link */
+static struct pub_slot pub[MAX_MAPPED_CHANNELS][2];
+static long   blk_ctr[MAX_MAPPED_CHANNELS];       /* own filter thread only */
+static double link_prev[MAX_MAPPED_CHANNELS];     /* link gain at block end */
+static double link_now[MAX_MAPPED_CHANNELS];      /* display copy (atomic) */
+static long   link_faults[MAX_MAPPED_CHANNELS];   /* atomic, own thread writes */
+
+/* Relaxed atomics: the ordering comes from BruteFIR's per-block barrier
+   (design 2.4); atomic access only keeps the compiler from tearing or
+   caching the values and documents the cross-thread accesses (TSan). */
+static inline double a_load_d(const double *p)
+{ double v; __atomic_load(p, &v, __ATOMIC_RELAXED); return v; }
+static inline void a_store_d(double *p, double v)
+{ __atomic_store(p, &v, __ATOMIC_RELAXED); }
+static inline long a_load_l(const long *p)
+{ return __atomic_load_n(p, __ATOMIC_RELAXED); }
+static inline void a_store_l(long *p, long v)
+{ __atomic_store_n(p, v, __ATOMIC_RELAXED); }
+static inline int a_load_i(const int *p)
+{ return __atomic_load_n(p, __ATOMIC_RELAXED); }
+static inline void a_store_i(int *p, int v)
+{ __atomic_store_n(p, v, __ATOMIC_RELAXED); }
 
 static inline double db2lin(double db) { return pow(10.0, db / 20.0); }
 
@@ -529,17 +606,280 @@ parse_group(int (*get_config_token)(union bflexval *lexval),
     return 0;
 }
 
+/* Comma list of strings up to ';'. Returns count, or -1 (message printed)
+   if longer than `max` or malformed. */
+static int
+parse_string_list(int (*get_config_token)(union bflexval *lexval),
+                  char out[][BF_MAXOBJECTNAME], int max, const char *what)
+{
+    union bflexval lexval;
+    int n = 0, token = BF_LEX_COMMA;
+    while (token == BF_LEX_COMMA) {
+        if (get_config_token(&lexval) != BF_LEXVAL_STRING) {
+            fprintf(stderr, "PROTECT: link: %s: expected channel name "
+                    "string.\n", what);
+            return -1;
+        }
+        if (n == max) {
+            fprintf(stderr, "PROTECT: link: %s: too many entries (max %d).\n",
+                    what, max);
+            return -1;
+        }
+        if (lexval.string[0] == '\0' ||
+            strlen(lexval.string) >= BF_MAXOBJECTNAME)
+        {
+            fprintf(stderr, "PROTECT: link: %s: empty or too long name.\n",
+                    what);
+            return -1;
+        }
+        memcpy(out[n], lexval.string, strlen(lexval.string) + 1);  /* length checked above */
+        out[n][BF_MAXOBJECTNAME - 1] = '\0';
+        n++;
+        token = get_config_token(&lexval);
+    }
+    if (token != BF_LEX_EOS) {
+        fprintf(stderr, "PROTECT: link: %s: expected ',' or ';'.\n", what);
+        return -1;
+    }
+    return n;
+}
+
+static int
+parse_real_list(int (*get_config_token)(union bflexval *lexval),
+                double out[], int max, const char *what)
+{
+    union bflexval lexval;
+    int n = 0, token = BF_LEX_COMMA;
+    while (token == BF_LEX_COMMA) {
+        if (get_config_token(&lexval) != BF_LEXVAL_REAL) {
+            fprintf(stderr, "PROTECT: link: %s: expected number.\n", what);
+            return -1;
+        }
+        if (n == max) {
+            fprintf(stderr, "PROTECT: link: %s: too many entries (max %d).\n",
+                    what, max);
+            return -1;
+        }
+        out[n++] = lexval.real;
+        token = get_config_token(&lexval);
+    }
+    if (token != BF_LEX_EOS) {
+        fprintf(stderr, "PROTECT: link: %s: expected ',' or ';'.\n", what);
+        return -1;
+    }
+    return n;
+}
+
+/* link: "<name>" { channels/drive/ratio/offset_db/enabled }. Only syntax
+   and per-field ranges here; names are resolved in resolve_links() after
+   the whole config is read (so "link" may stand before or after the
+   groups). */
+static int
+parse_link(int (*get_config_token)(union bflexval *lexval),
+           struct link_cfg *lk, const char *name)
+{
+    union bflexval lexval;
+    int token, seen_ch = 0, seen_en = 0;
+
+    memset(lk, 0, sizeof(*lk));
+    lk->enabled = 1;
+    if (name[0] == '\0' || strlen(name) >= BF_MAXOBJECTNAME) {
+        fprintf(stderr, "PROTECT: link: empty or too long link name.\n");
+        return -1;
+    }
+    memcpy(lk->name, name, strlen(name) + 1);          /* length checked above */
+
+    while ((token = get_config_token(&lexval)) > 0) {
+        if (token == BF_LEX_RBRACE) break;
+        if (token != BF_LEXVAL_FIELD) {
+            fprintf(stderr, "PROTECT: link '%s': expected field.\n", name);
+            return -1;
+        }
+        if (strcmp(lexval.field, "channels") == 0) {
+            if (seen_ch++) goto dup;
+            lk->n = parse_string_list(get_config_token, lk->member_name,
+                                      MAX_CH_PER_LINK, "channels");
+            if (lk->n < 0) return -1;
+        } else if (strcmp(lexval.field, "drive") == 0) {
+            if (lk->n_drive) goto dup;
+            lk->n_drive = parse_string_list(get_config_token, lk->drive_name,
+                                            MAX_CH_PER_LINK, "drive");
+            if (lk->n_drive < 0) return -1;
+        } else if (strcmp(lexval.field, "ratio") == 0) {
+            if (lk->n_ratio) goto dup;
+            lk->n_ratio = parse_real_list(get_config_token, lk->ratio,
+                                          MAX_CH_PER_LINK, "ratio");
+            if (lk->n_ratio < 0) return -1;
+        } else if (strcmp(lexval.field, "offset_db") == 0) {
+            if (lk->n_offset) goto dup;
+            lk->n_offset = parse_real_list(get_config_token, lk->offset_db,
+                                           MAX_CH_PER_LINK, "offset_db");
+            if (lk->n_offset < 0) return -1;
+        } else if (strcmp(lexval.field, "enabled") == 0) {
+            if (seen_en++) goto dup;
+            GET_TOKEN(BF_LEXVAL_REAL, "link: enabled: expected number.\n");
+            lk->enabled = (lexval.real != 0.0);
+            GET_TOKEN(BF_LEX_EOS, "link: expected ';'.\n");
+        } else {
+            fprintf(stderr, "PROTECT: link '%s': unknown field '%s'.\n",
+                    name, lexval.field);
+            return -1;
+        }
+        continue;
+dup:
+        fprintf(stderr, "PROTECT: link '%s': field '%s' given twice.\n",
+                name, lexval.field);
+        return -1;
+    }
+    if (lk->n < 2) {
+        fprintf(stderr, "PROTECT: link '%s': needs 'channels' with at least "
+                "2 members (got %d).\n", name, lk->n);
+        return -1;
+    }
+    if (lk->n_ratio && lk->n_ratio != lk->n) {
+        fprintf(stderr, "PROTECT: link '%s': ratio has %d entries, channels "
+                "has %d (one per member, same order).\n", name, lk->n_ratio,
+                lk->n);
+        return -1;
+    }
+    if (lk->n_offset && lk->n_offset != lk->n) {
+        fprintf(stderr, "PROTECT: link '%s': offset_db has %d entries, "
+                "channels has %d (one per member, same order).\n", name,
+                lk->n_offset, lk->n);
+        return -1;
+    }
+    for (int m = 0; m < lk->n; m++) {
+        if (!lk->n_ratio) lk->ratio[m] = 1.0;
+        if (!lk->n_offset) lk->offset_db[m] = 0.0;
+        /* written as !(a <= x <= b) so that NaN is rejected too */
+        if (!(lk->ratio[m] >= 0.0 && lk->ratio[m] <= LINK_RATIO_MAX)) {
+            fprintf(stderr, "PROTECT: link '%s': ratio %g for '%s' out of "
+                    "range [0, %g].\n", name, lk->ratio[m],
+                    lk->member_name[m], LINK_RATIO_MAX);
+            return -1;
+        }
+        if (!(lk->offset_db[m] >= 0.0 && lk->offset_db[m] <= LINK_OFFSET_MAX)) {
+            fprintf(stderr, "PROTECT: link '%s': offset_db %g for '%s' out "
+                    "of range [0, %g].\n", name, lk->offset_db[m],
+                    lk->member_name[m], LINK_OFFSET_MAX);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* After the parse loop and the group mapping: names -> intnames, and all
+   cross checks of design 3.3. */
+static int
+resolve_links(const int n_channels[2], const struct bfchannel *channels[2])
+{
+    for (int i = 0; i < MAX_MAPPED_CHANNELS; i++) {
+        chan_link[i] = -1;
+        chan_member[i] = -1;
+    }
+    for (int li = 0; li < n_links; li++) {
+        struct link_cfg *lk = &links[li];
+        for (int lj = 0; lj < li; lj++) {
+            if (strcmp(links[lj].name, lk->name) == 0) {
+                fprintf(stderr, "PROTECT: link name '%s' used twice.\n",
+                        lk->name);
+                return -1;
+            }
+        }
+        for (int m = 0; m < lk->n; m++) {
+            int idx = -1;
+            for (int i = 0; i < n_channels[BF_OUT]; i++) {
+                if (strcmp(lk->member_name[m], channels[BF_OUT][i].name) == 0) {
+                    idx = channels[BF_OUT][i].intname;
+                    break;
+                }
+            }
+            if (idx < 0) {
+                fprintf(stderr, "PROTECT: link '%s': '%s' is not a BruteFIR "
+                        "output channel.\n", lk->name, lk->member_name[m]);
+                return -1;
+            }
+            if (idx >= MAX_MAPPED_CHANNELS) {
+                fprintf(stderr, "PROTECT: link '%s': intname %d out of "
+                        "range.\n", lk->name, idx);
+                return -1;
+            }
+            if (chan_group[idx] < 0) {
+                fprintf(stderr, "PROTECT: link '%s': '%s' is in no protect "
+                        "group (would not pass through this module).\n",
+                        lk->name, lk->member_name[m]);
+                return -1;
+            }
+            for (int q = 0; q < m; q++) {
+                if (lk->member_ch[q] == idx) {
+                    fprintf(stderr, "PROTECT: link '%s': '%s' listed twice.\n",
+                            lk->name, lk->member_name[m]);
+                    return -1;
+                }
+            }
+            if (chan_link[idx] >= 0) {
+                fprintf(stderr, "PROTECT: '%s' is in more than one link "
+                        "('%s' and '%s') - write one link with the union "
+                        "instead.\n", lk->member_name[m],
+                        links[chan_link[idx]].name, lk->name);
+                return -1;
+            }
+            lk->member_ch[m] = idx;
+            chan_link[idx] = li;
+            chan_member[idx] = m;
+        }
+        if (lk->n_drive == 0) {
+            for (int m = 0; m < lk->n; m++) lk->drives[m] = 1;
+        } else {
+            for (int d = 0; d < lk->n_drive; d++) {
+                int found = -1;
+                for (int m = 0; m < lk->n; m++) {
+                    if (strcmp(lk->drive_name[d], lk->member_name[m]) == 0) {
+                        found = m;
+                        break;
+                    }
+                }
+                if (found < 0) {
+                    fprintf(stderr, "PROTECT: link '%s': drive '%s' is not a "
+                            "member of the link.\n", lk->name,
+                            lk->drive_name[d]);
+                    return -1;
+                }
+                if (lk->drives[found]) {
+                    fprintf(stderr, "PROTECT: link '%s': drive '%s' listed "
+                            "twice.\n", lk->name, lk->drive_name[d]);
+                    return -1;
+                }
+                lk->drives[found] = 1;
+            }
+        }
+        char line[1024];
+        int pos = snprintf(line, sizeof(line), "PROTECT: link '%s'%s:",
+                           lk->name, lk->enabled ? "" : " (off)");
+        for (int m = 0; m < lk->n && pos > 0 && (size_t)pos < sizeof(line); m++) {
+            pos += snprintf(line + pos, sizeof(line) - pos, " %s(%s,%.2f,%.1fdB)",
+                            lk->member_name[m],
+                            lk->drives[m] ? "drive" : "follow",
+                            lk->ratio[m], lk->offset_db[m]);
+        }
+        fprintf(stderr, "%s\n", line);
+    }
+    return 0;
+}
+
 /* ---- Kern: Sample-Verarbeitung ----------------------------------------- */
 
-static inline void
-process_channel(struct group *g, int gi, int ci, double *samples, int n)
+/* Detector + checkpoint smoothing for ONE sample: unchanged v3 code, only
+   moved out of process_channel() so that the plain path and the link path
+   share exactly the same detector (design 3.2: the invariant rests on the
+   detectors being identical with and without link; test T1a/T1b). */
+static inline double
+detect_sample(struct group *g, struct channel_runtime *rt, double s)
 {
-    struct channel_runtime *rt = &ch_runtime[gi][ci];
-    int i, l;
-    double s, mag, target, alpha, combined;
+    int l;
+    double mag, target, alpha, combined;
 
-    for (i = 0; i < n; i++) {
-        s = samples[i];
+    {
         mag = fabs(s);
         combined = 1.0;
 
@@ -614,14 +954,94 @@ process_channel(struct group *g, int gi, int ci, double *samples, int n)
             }
             if (ls->gain < combined) combined = ls->gain;
         }
-        samples[i] = s * combined;
     }
+    return combined;
+}
+
+static inline void
+process_channel(struct group *g, int gi, int ci, double *samples, int n)
+{
+    struct channel_runtime *rt = &ch_runtime[gi][ci];
+    int i;
+    double s;
+
+    for (i = 0; i < n; i++) {
+        s = samples[i];
+        samples[i] = s * detect_sample(g, rt, s);
+    }
+}
+
+/* Link path (design 2.3): same detector, then min(own, link ramp). The
+   ramp goes linearly from L_prev (link gain at the end of the previous
+   block) to L_tgt over this block. Returns the minimum OWN gain of the
+   block (published to the partners - never the linked gain, design 2.3
+   point 2, otherwise symmetric links latch). */
+static inline double
+process_channel_link(struct group *g, int gi, int ci, double *samples,
+                     int n, double L_prev, double L_tgt)
+{
+    struct channel_runtime *rt = &ch_runtime[gi][ci];
+    double own_min = 1.0;
+    double dL = L_tgt - L_prev;
+
+    for (int i = 0; i < n; i++) {
+        double s = samples[i];
+        double combined = detect_sample(g, rt, s);
+        if (combined < own_min) own_min = combined;
+        double L_i = L_prev + dL * (double)(i + 1) / (double)n;
+        /* NaN-safe: a NaN L_i compares false -> own gain is applied */
+        double g_i = (L_i < combined) ? L_i : combined;
+        samples[i] = s * g_i;
+    }
+    return own_min;
+}
+
+/* Link target for block k of `channel` from the partners' block k-1. */
+static inline double
+link_target(int channel, struct link_cfg *lk, long k)
+{
+    double L_tgt = 1.0;
+    int me = chan_member[channel];
+
+    for (int m = 0; m < lk->n; m++) {
+        if (m == me || !lk->drives[m]) continue;
+        int p = lk->member_ch[m];
+        struct pub_slot *s = &pub[p][(k - 1) & 1];
+        double gp = a_load_d(&s->gmin);
+        long bk = a_load_l(&s->blk);
+        if (bk != k - 1) {
+            /* must not happen under BruteFIR's barrier (design 2.4);
+               if the thread model ever changes: count, take the more
+               conservative of both slots. The other slot may be written
+               by the partner in this very block; the access is atomic, so
+               it yields the old or the new value - either is a real gain
+               of the partner, and the min stays <= the stale slot. */
+            a_store_l(&link_faults[channel], a_load_l(&link_faults[channel]) + 1);
+            double g0 = a_load_d(&pub[p][0].gmin);
+            double g1 = a_load_d(&pub[p][1].gmin);
+            gp = (g0 < g1) ? g0 : g1;      /* NaN -> rejected below */
+        }
+        if (!(gp > 0.0 && gp <= 1.0)) {   /* NaN/0/>1: ignore this partner */
+            a_store_l(&link_faults[channel], a_load_l(&link_faults[channel]) + 1);
+            continue;                      /* own limits stay active */
+        }
+        double a_db = -20.0 * log10(gp);                       /* >= 0 */
+        double over = a_db - lk->offset_db[me];
+        double f_db = lk->ratio[me] * (over > 0.0 ? over : 0.0);
+        double Lp = pow(10.0, -f_db / 20.0);                   /* (0,1] */
+        if (Lp < L_tgt) L_tgt = Lp;
+    }
+    return L_tgt;
 }
 
 static void
 output_timed(void *buf, int channel)
 {
-    int gi, ci;
+    int gi, ci, li;
+    double tmp[8192];
+    double *samples;
+    float *fbuf = NULL;
+    int n = block_length;
 
     if (channel < 0 || channel >= MAX_MAPPED_CHANNELS ||
         chan_group[channel] < 0)
@@ -632,14 +1052,38 @@ output_timed(void *buf, int channel)
     ci = chan_idx[channel];
 
     if (realsize == 4) {
-        float *fbuf = (float *)buf;
-        double tmp[8192];
-        int n = block_length;
+        fbuf = (float *)buf;
         for (int i = 0; i < n; i++) tmp[i] = fbuf[i];
-        process_channel(&groups[gi], gi, ci, tmp, n);
-        for (int i = 0; i < n; i++) fbuf[i] = (float)tmp[i];
+        samples = tmp;
     } else {
-        process_channel(&groups[gi], gi, ci, (double *)buf, block_length);
+        samples = (double *)buf;
+    }
+
+    li = chan_link[channel];
+    if (li < 0) {
+        /* no link: unchanged v3 path */
+        process_channel(&groups[gi], gi, ci, samples, n);
+    } else {
+        struct link_cfg *lk = &links[li];
+        long k = ++blk_ctr[channel];
+        double L_prev = link_prev[channel];
+        double L_tgt = 1.0;
+        if (a_load_i(&lk->enabled)) {
+            L_tgt = link_target(channel, lk, k);
+        } else {
+            L_prev = 1.0;        /* link off: immediately own limits only */
+        }
+        double own_min = process_channel_link(&groups[gi], gi, ci, samples,
+                                              n, L_prev, L_tgt);
+        link_prev[channel] = L_tgt;
+        a_store_d(&link_now[channel], L_tgt);
+        struct pub_slot *w = &pub[channel][k & 1];      /* always publish */
+        a_store_d(&w->gmin, own_min);
+        a_store_l(&w->blk, k);
+    }
+
+    if (fbuf != NULL) {
+        for (int i = 0; i < n; i++) fbuf[i] = (float)tmp[i];
     }
 }
 
@@ -719,8 +1163,29 @@ bflogic_preinit(/* bfmod.h names these (version_minor, version_major, ...),
             GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
             output_scale = lexval.real;
             GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
+        } else if (strcmp(lexval.field, "link") == 0) {
+            char link_name[BF_MAXOBJECTNAME];
+            GET_TOKEN(BF_LEXVAL_STRING, "expected link name string.\n");
+            if (strlen(lexval.string) >= BF_MAXOBJECTNAME) {
+                fprintf(stderr, "PROTECT: link name too long.\n");
+                return -1;
+            }
+            memcpy(link_name, lexval.string, strlen(lexval.string) + 1);
+            link_name[BF_MAXOBJECTNAME - 1] = '\0';
+            GET_TOKEN(BF_LEX_LBRACE, "expected '{' after link name.\n");
+            if (n_links == MAX_LINKS) {
+                fprintf(stderr, "PROTECT: too many links (max %d).\n",
+                        MAX_LINKS);
+                return -1;
+            }
+            if (parse_link(get_config_token, &links[n_links], link_name) != 0)
+            {
+                return -1;
+            }
+            GET_TOKEN(BF_LEX_EOS, "expected ';' after link block.\n");
+            n_links++;
         } else {
-            fprintf(stderr, "PROTECT: expected 'chain', 'group' or "
+            fprintf(stderr, "PROTECT: expected 'chain', 'group', 'link' or "
                     "'output_scale', got '%s'.\n", lexval.field);
             return -1;
         }
@@ -758,6 +1223,15 @@ bflogic_preinit(/* bfmod.h names these (version_minor, version_major, ...),
                                 "range.\n", idx);
                         return -1;
                     }
+                    if (chan_group[idx] >= 0) {
+                        /* used to overwrite the first mapping silently
+                           (side finding, link design 1.4/3.3) */
+                        fprintf(stderr, "PROTECT: output channel '%s' is in "
+                                "more than one group (group %d and %d) - "
+                                "config error.\n", groups[g].ch_names[c],
+                                chan_group[idx], g);
+                        return -1;
+                    }
                     groups[g].ch_intname[c] = idx;
                     chan_group[idx] = g;
                     chan_idx[idx] = c;
@@ -773,9 +1247,26 @@ bflogic_preinit(/* bfmod.h names these (version_minor, version_major, ...),
         }
     }
 
+    if (resolve_links(n_channels, channels) != 0) {
+        return -1;
+    }
+
     bfevents->output_timed = output_timed;
     *fork_mode = BF_FORK_DONT_FORK;
     return 0;
+}
+
+static void
+link_runtime_reset(void)
+{
+    for (int i = 0; i < MAX_MAPPED_CHANNELS; i++) {
+        pub[i][0].gmin = pub[i][1].gmin = 1.0;   /* start without reduction */
+        pub[i][0].blk = pub[i][1].blk = 0;
+        blk_ctr[i] = 0;
+        link_prev[i] = 1.0;
+        link_now[i] = 1.0;
+        link_faults[i] = 0;
+    }
 }
 
 int
@@ -805,8 +1296,15 @@ bflogic_init(struct bfaccess *bfaccess,
             }
         }
     }
-    fprintf(stderr, "PROTECT: initialised, %d chain(s), %d group(s), "
-            "realsize=%d\n", n_chains, n_groups, realsize);
+    link_runtime_reset();
+    if (n_links > 0) {
+        fprintf(stderr, "PROTECT: initialised, %d chain(s), %d group(s), "
+                "%d link(s), realsize=%d\n", n_chains, n_groups, n_links,
+                realsize);
+    } else {
+        fprintf(stderr, "PROTECT: initialised, %d chain(s), %d group(s), "
+                "realsize=%d\n", n_chains, n_groups, realsize);
+    }
     memset(msg, 0, sizeof(msg));
     return 0;
 }
@@ -882,6 +1380,67 @@ bflogic_command(const char params[])
     memset(msg, 0, sizeof(msg));
 
     while (*params == ' ' || *params == '\t') params++;
+
+    /* channel link: "link [list]" | "link on <name>|all" | "link off <name>|all".
+       "off" only removes the ADDITIONAL reduction; every channel's own
+       limits stay as they are, so it is allowed without restriction. */
+    if (strncmp(params, "link", 4) == 0 &&
+        (params[4] == '\0' || params[4] == ' ' || params[4] == '\t' ||
+         params[4] == '\n' || params[4] == '\r'))
+    {
+        const char *q = params + 4;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == '\0' || *q == '\n' || *q == '\r' || strncmp(q, "list", 4) == 0) {
+            if (n_links == 0) {
+                msg_append(&p, &remaining, "PROTECT: no links configured\n");
+                return 0;
+            }
+            msg_append(&p, &remaining, "%-12s  %-5s  %-12s  %-6s  %5s  %6s  %9s  %7s\n",
+                       "LINK", "STATE", "CHANNEL", "ROLE", "RATIO", "OFFSET",
+                       "LINK_dB", "FAULTS");
+            for (int li = 0; li < n_links; li++) {
+                struct link_cfg *lk = &links[li];
+                for (int m = 0; m < lk->n; m++) {
+                    int ch = lk->member_ch[m];
+                    msg_append(&p, &remaining,
+                               "%-12s  %-5s  %-12s  %-6s  %5.2f  %6.1f  %9.2f  %7ld\n",
+                               lk->name, a_load_i(&lk->enabled) ? "ON" : "off",
+                               lk->member_name[m],
+                               lk->drives[m] ? "drive" : "follow",
+                               lk->ratio[m], lk->offset_db[m],
+                               gain_to_db(a_load_d(&link_now[ch])),
+                               a_load_l(&link_faults[ch]));
+                }
+            }
+            return 0;
+        }
+        if (strncmp(q, "on ", 3) == 0 || strncmp(q, "off ", 4) == 0) {
+            int turn_on = (q[1] == 'n');
+            const char *name = q + (turn_on ? 3 : 4);
+            while (*name == ' ') name++;
+            char nm[BF_MAXOBJECTNAME];
+            size_t k = 0;
+            while (name[k] && name[k] != ' ' && name[k] != '\n' &&
+                   name[k] != '\r' && k < sizeof(nm) - 1)
+            {
+                nm[k] = name[k]; k++;
+            }
+            nm[k] = 0;
+            int all = (strcmp(nm, "all") == 0), hit = 0;
+            for (int li = 0; li < n_links; li++) {
+                if (!all && strcmp(links[li].name, nm) != 0) continue;
+                a_store_i(&links[li].enabled, turn_on);
+                hit++;
+            }
+            msg_append(&p, &remaining, "PROTECT: link %s '%s': %d link(s) "
+                       "changed%s\n", turn_on ? "on" : "off", nm, hit,
+                       hit ? "" : " - name not found");
+            return 0;
+        }
+        msg_append(&p, &remaining, "PROTECT: usage: link [list] | link on "
+                   "<name>|all | link off <name>|all\n");
+        return 0;
+    }
 
     /* v3: "list" | "on <name>|all" | "off <name>|all" */
     if (strncmp(params, "list", 4) == 0) {
@@ -986,6 +1545,20 @@ bflogic_command(const char params[])
                         (gr->limits[l].type == LIMIT_RMS) ? "rms" : "peak",
                         ls->overs, overs_to_ms(ls->overs), ls->gain,
                         gain_to_db(ls->gain));
+                    if (n_links > 0) {
+                        /* the closing '}' above is undone and re-added
+                           with the link fields (only when links exist,
+                           so link-free output stays byte-identical) */
+                        int ch = gr->ch_intname[c];
+                        int li = chan_link[ch];
+                        if (p > msg && p[-1] == '}') { p--; remaining++; }
+                        msg_append(&p, &remaining,
+                            ",\"link\":\"%s\",\"link_gain_db\":%.2f,"
+                            "\"link_faults\":%ld}",
+                            li >= 0 ? links[li].name : "",
+                            gain_to_db(a_load_d(&link_now[ch])),
+                            a_load_l(&link_faults[ch]));
+                    }
                     first = 0;
                 }
             }
@@ -1039,6 +1612,23 @@ bflogic_command(const char params[])
                    "everything, \"lmc <idx> json\" for machine-readable "
                    "output)\n",
                    hidden, hidden == 1 ? "" : "s");
+    }
+    if (n_links > 0) {
+        msg_append(&p, &remaining, "\n%-12s  %-12s  %-6s  %9s  %7s\n",
+                   "LINK", "CHANNEL", "ROLE", "LINK_dB", "FAULTS");
+        for (int li = 0; li < n_links; li++) {
+            struct link_cfg *lk = &links[li];
+            for (int m = 0; m < lk->n; m++) {
+                int ch = lk->member_ch[m];
+                double ldb = gain_to_db(a_load_d(&link_now[ch]));
+                long lf = a_load_l(&link_faults[ch]);
+                if (!show_all && ldb > -0.01 && lf == 0) continue;
+                msg_append(&p, &remaining, "%-12s  %-12s  %-6s  %9.2f  %7ld%s\n",
+                           lk->name, lk->member_name[m],
+                           lk->drives[m] ? "drive" : "follow", ldb, lf,
+                           a_load_i(&lk->enabled) ? "" : "  OFF");
+            }
+        }
     }
     return 0;
 }

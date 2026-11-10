@@ -1,0 +1,297 @@
+[run_tests] Git Bash (MINGW64_NT-10.0-26200) detected -> re-running inside WSL 'Ubuntu-24.04': /mnt/c/Users/micha/.wmux/company-worktrees/e7038400f4ed/dev-2-06bd9b7d/protect-link/tests/run_tests.sh
+[run_tests] shell: /usr/bin/bash 5.2.21(1)-release, Linux 6.6.87.2-microsoft-standard-WSL2, gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+[run_tests] source: /mnt/c/Users/micha/.wmux/company-worktrees/e7038400f4ed/dev-2-06bd9b7d/protect-link, build dir: /tmp/protect-link-tests
+
+== build: module (-Wall -Wextra, strict C99) ==
+  reference (deployed) : exit 0, 18 warning(s)
+  new (link)           : exit 0, 18 warning(s)
+  PASS no new warnings
+  PASS make (Makefile) -> protect.bflogic
+
+== build: harness ==
+  PASS harness builds (new, reference, TSan, hot-path wrap); compiler messages: /tmp/protect-link-tests/harness_build.log (57 warnings, of which 6 are not 'unused parameter'; the module itself is checked above)
+
+== tests ==
+-- T6 config errors -> preinit -1 (BruteFIR: BF_EXIT_INVALID_CONFIG) --
+  PASS T6 dup_link_name rejected: link name 'a' used twice.
+  PASS T6 one_member rejected: link 'a': needs 'channels' with at least 2 members (got 1).
+  PASS T6 too_many_members rejected: link: channels: too many entries (max 8).
+  PASS T6 too_many_links rejected: too many links (max 4).
+  PASS T6 unknown_output rejected: link 'a': 'esl_l' is not a BruteFIR output channel.
+  PASS T6 member_no_group rejected: link 'a': 'alkoven' is in no protect group (would not pass through this module).
+  PASS T6 chan_two_groups rejected: output channel 'esll' is in more than one group (group 1 and 3) - config error.
+  PASS T6 chan_two_groups_same rejected: output channel 'subl' is in more than one group (group 0 and 0) - config error.
+  PASS T6 chan_two_links rejected: 'esll' is in more than one link ('a' and 'b') - write one link with the union instead.
+  PASS T6 dup_member rejected: link 'a': 'esll' listed twice.
+  PASS T6 drive_not_member rejected: link 'a': drive 'eslr' is not a member of the link.
+  PASS T6 drive_dup rejected: link 'a': drive 'esll' listed twice.
+  PASS T6 ratio_len rejected: link 'a': ratio has 1 entries, channels has 2 (one per member, same order).
+  PASS T6 offset_len rejected: link 'a': offset_db has 3 entries, channels has 2 (one per member, same order).
+  PASS T6 ratio_high rejected: link 'a': ratio 1.5 for 'alkoven' out of range [0, 1].
+  PASS T6 ratio_neg rejected: link 'a': ratio -0.1 for 'esll' out of range [0, 1].
+  PASS T6 offset_high rejected: link 'a': offset_db 41 for 'alkoven' out of range [0, 40].
+  PASS T6 offset_neg rejected: link 'a': offset_db -1 for 'esll' out of range [0, 40].
+  PASS T6 unknown_field rejected: link 'a': unknown field 'gain'.
+  PASS T6 field_twice rejected: link 'a': field 'channels' given twice.
+  PASS T6 empty_name rejected: link: empty or too long link name.
+  PASS T6 no_channels rejected: link 'a': needs 'channels' with at least 2 members (got 0).
+  PASS T6 ratio_not_number rejected: link: ratio: expected number.
+  PASS T6 valid config simple_nolink accepted
+  PASS T6 valid config t2 accepted -> link 'alk_fill': esll(drive,1.00,0.0dB) alkoven(follow,1.00,0.0dB)
+  PASS T6 valid config t5 accepted -> link 'alk_fill': esll(drive,1.00,0.0dB) alkoven(follow,0.50,0.0dB)
+  PASS T6 valid config t4_o0 accepted -> link 'esl_stereo': esll(drive,1.00,0.0dB) eslr(drive,1.00,0.0dB)
+  PASS T6 valid config t4_o2 accepted -> link 'esl_stereo': esll(drive,1.00,2.0dB) eslr(drive,1.00,2.0dB)
+  PASS T6 valid config ok_link_before_group accepted -> link 'x': esll(drive,1.00,0.0dB) alkoven(drive,1.00,0.0dB)
+  PASS T6 valid config ok_disabled accepted -> link 'x' (off): esll(drive,1.00,0.0dB) alkoven(drive,1.00,0.0dB)
+  PASS T6 valid config ok_design_D accepted -> link 'all_main': esll(drive,1.00,0.0dB) eslr(drive,1.00,0.0dB) alkoven(follow,1.00,0.0dB) subl(follow,1.00,0.0dB) subr(follow,1.00,0.0dB)
+  PASS T6 valid config live_nolink accepted
+  PASS T6 valid config live_alk_nolink accepted
+  PASS T6 valid config live_alk_link accepted -> link 'esl_main': esll(drive,1.00,0.0dB) eslr(drive,1.00,0.0dB) alkoven(follow,1.00,0.0dB)
+  PASS T6 valid config gen_sq48_link accepted -> link 'alk_fill': esll(drive,1.00,0.0dB) alkoven(follow,1.00,0.0dB)
+    (reference module accepts chan_two_groups silently: rc=0 - the side finding, now fixed)
+
+-- T1b no link: new module bit-identical to the deployed one --
+  PASS T1b live_nolink 44100 Hz realsize=8 3000 blocks: hash 8de098d6b060ec8b identical
+  PASS T1b live_nolink 44100 Hz realsize=4 3000 blocks: hash 03fbddb5fd25e458 identical
+  PASS T1b live_nolink 48000 Hz realsize=8 20000 blocks: hash de75361669e021d0 identical
+  PASS T1b live_nolink 48000 Hz realsize=4 20000 blocks: hash 1357df5a9c11f5f8 identical
+  PASS T1b live_nolink 88200 Hz realsize=8 3000 blocks: hash 33d8858e8f578090 identical
+  PASS T1b live_nolink 88200 Hz realsize=4 3000 blocks: hash c2ef31fdedf37d25 identical
+  PASS T1b live_nolink 96000 Hz realsize=8 3000 blocks: hash c8581b6f38b17162 identical
+  PASS T1b live_nolink 96000 Hz realsize=4 3000 blocks: hash 96e35461052a3627 identical
+  PASS T1b live_nolink 176400 Hz realsize=8 3000 blocks: hash ca9f9f3e8f3a72f3 identical
+  PASS T1b live_nolink 176400 Hz realsize=4 3000 blocks: hash 306c217f612d5f63 identical
+  PASS T1b live_nolink 192000 Hz realsize=8 3000 blocks: hash 9f451a7493f2210c identical
+  PASS T1b live_nolink 192000 Hz realsize=4 3000 blocks: hash 5c9b5411e64d0cce identical
+  PASS T1b live_alk_nolink 44100 Hz realsize=8 3000 blocks: hash b1a36d0c64d9455f identical
+  PASS T1b live_alk_nolink 44100 Hz realsize=4 3000 blocks: hash 5670e5a4e25924b9 identical
+  PASS T1b live_alk_nolink 48000 Hz realsize=8 20000 blocks: hash d826ac6625975273 identical
+  PASS T1b live_alk_nolink 48000 Hz realsize=4 20000 blocks: hash dd97222ab6a48fd8 identical
+  PASS T1b live_alk_nolink 88200 Hz realsize=8 3000 blocks: hash 0eb3b9ccd4017e31 identical
+  PASS T1b live_alk_nolink 88200 Hz realsize=4 3000 blocks: hash fef626c6123828fe identical
+  PASS T1b live_alk_nolink 96000 Hz realsize=8 3000 blocks: hash e7b6ba46d8f4a74d identical
+  PASS T1b live_alk_nolink 96000 Hz realsize=4 3000 blocks: hash 8706262ef1968726 identical
+  PASS T1b live_alk_nolink 176400 Hz realsize=8 3000 blocks: hash 488e7235077e3735 identical
+  PASS T1b live_alk_nolink 176400 Hz realsize=4 3000 blocks: hash 8bd6cffdaaca9b10 identical
+  PASS T1b live_alk_nolink 192000 Hz realsize=8 3000 blocks: hash ed85d686781ec2e8 identical
+  PASS T1b live_alk_nolink 192000 Hz realsize=4 3000 blocks: hash b4929d9fdc98ed88 identical
+  PASS T1b lmc output (status/all/json/list/off/on/reset) byte-identical (7466 bytes)
+  PASS T1b startup log byte-identical (23 lines)
+
+-- T1a invariant: |y_link| <= |y_nolink| sample-exact, detectors bit-identical --
+T1a rate=48000 mode=seq blocks=100000 samples=512000000
+  PASS reference run (no link) completed
+  PASS own detector gains bit-identical with/without link in every block (0 blocks differ)
+  PASS |y_link| <= |y_nolink| for every sample (0 violations, worst 0)
+  PASS link actually reduced 173614121 samples (test is not vacuous)
+  PASS link_faults = 0 (0)
+T1a rate=48000 mode=thr blocks=20000 samples=102400000
+  PASS reference run (no link) completed
+  PASS own detector gains bit-identical with/without link in every block (0 blocks differ)
+  PASS |y_link| <= |y_nolink| for every sample (0 violations, worst 0)
+  PASS link actually reduced 35204484 samples (test is not vacuous)
+  PASS link_faults = 0 (0)
+T1a rate=44100 mode=seq blocks=10000 samples=51200000
+  PASS reference run (no link) completed
+  PASS own detector gains bit-identical with/without link in every block (0 blocks differ)
+  PASS |y_link| <= |y_nolink| for every sample (0 violations, worst 0)
+  PASS link actually reduced 17533539 samples (test is not vacuous)
+  PASS link_faults = 0 (0)
+T1a rate=88200 mode=seq blocks=10000 samples=51200000
+  PASS reference run (no link) completed
+  PASS own detector gains bit-identical with/without link in every block (0 blocks differ)
+  PASS |y_link| <= |y_nolink| for every sample (0 violations, worst 0)
+  PASS link actually reduced 17140490 samples (test is not vacuous)
+  PASS link_faults = 0 (0)
+T1a rate=96000 mode=seq blocks=10000 samples=51200000
+  PASS reference run (no link) completed
+  PASS own detector gains bit-identical with/without link in every block (0 blocks differ)
+  PASS |y_link| <= |y_nolink| for every sample (0 violations, worst 0)
+  PASS link actually reduced 17074461 samples (test is not vacuous)
+  PASS link_faults = 0 (0)
+T1a rate=176400 mode=seq blocks=10000 samples=51200000
+  PASS reference run (no link) completed
+  PASS own detector gains bit-identical with/without link in every block (0 blocks differ)
+  PASS |y_link| <= |y_nolink| for every sample (0 violations, worst 0)
+  PASS link actually reduced 16687820 samples (test is not vacuous)
+  PASS link_faults = 0 (0)
+T1a rate=192000 mode=seq blocks=10000 samples=51200000
+  PASS reference run (no link) completed
+  PASS own detector gains bit-identical with/without link in every block (0 blocks differ)
+  PASS |y_link| <= |y_nolink| for every sample (0 violations, worst 0)
+  PASS link actually reduced 16558144 samples (test is not vacuous)
+  PASS link_faults = 0 (0)
+T1a rate=48000 mode=seq blocks=20000 samples=102400000
+  PASS reference run (no link) completed
+  PASS own detector gains bit-identical with/without link in every block (0 blocks differ)
+  PASS |y_link| <= |y_nolink| for every sample (0 violations, worst 0)
+  PASS link actually reduced 21829670 samples (test is not vacuous)
+  PASS link_faults = 0 (0)
+
+-- T2 alkoven follows esll 1:1 (all rates), T5 ratio 0.5, T4 stereo offset 0/2 --
+t2 rate=44100 mode=seq ratio=1.00 offset=0.0: driver max reduction 5.95 dB
+  PASS driver (esll) is really limiting beyond the dead zone (5.95 dB > offset+1)
+  PASS t2: follower block-end reduction = ratio*max(0,A_drv(k-1)-offset) within 0.00 dB (worst 9.99e-16 dB over 128 blocks)
+    t2: driver first >0.1 dB in block 43, follower in block 44 -> lag 1 block(s) = 23.2 ms @ 44100 Hz
+  PASS follower gain never > 1 (max 1.000000)
+  PASS link_faults = 0 (0)
+t2 rate=48000 mode=seq ratio=1.00 offset=0.0: driver max reduction 5.95 dB
+  PASS driver (esll) is really limiting beyond the dead zone (5.95 dB > offset+1)
+  PASS t2: follower block-end reduction = ratio*max(0,A_drv(k-1)-offset) within 0.00 dB (worst 1.33e-15 dB over 139 blocks)
+    t2: driver first >0.1 dB in block 46, follower in block 47 -> lag 1 block(s) = 21.3 ms @ 48000 Hz
+  PASS follower gain never > 1 (max 1.000000)
+  PASS link_faults = 0 (0)
+t2 rate=88200 mode=seq ratio=1.00 offset=0.0: driver max reduction 5.95 dB
+  PASS driver (esll) is really limiting beyond the dead zone (5.95 dB > offset+1)
+  PASS t2: follower block-end reduction = ratio*max(0,A_drv(k-1)-offset) within 0.00 dB (worst 1.78e-15 dB over 257 blocks)
+    t2: driver first >0.1 dB in block 86, follower in block 87 -> lag 1 block(s) = 11.6 ms @ 88200 Hz
+  PASS follower gain never > 1 (max 1.000000)
+  PASS link_faults = 0 (0)
+t2 rate=96000 mode=seq ratio=1.00 offset=0.0: driver max reduction 5.95 dB
+  PASS driver (esll) is really limiting beyond the dead zone (5.95 dB > offset+1)
+  PASS t2: follower block-end reduction = ratio*max(0,A_drv(k-1)-offset) within 0.00 dB (worst 1.33e-15 dB over 280 blocks)
+    t2: driver first >0.1 dB in block 93, follower in block 94 -> lag 1 block(s) = 10.7 ms @ 96000 Hz
+  PASS follower gain never > 1 (max 1.000000)
+  PASS link_faults = 0 (0)
+t2 rate=176400 mode=seq ratio=1.00 offset=0.0: driver max reduction 5.95 dB
+  PASS driver (esll) is really limiting beyond the dead zone (5.95 dB > offset+1)
+  PASS t2: follower block-end reduction = ratio*max(0,A_drv(k-1)-offset) within 0.00 dB (worst 1.78e-15 dB over 515 blocks)
+    t2: driver first >0.1 dB in block 172, follower in block 173 -> lag 1 block(s) = 5.8 ms @ 176400 Hz
+  PASS follower gain never > 1 (max 1.000000)
+  PASS link_faults = 0 (0)
+t2 rate=192000 mode=seq ratio=1.00 offset=0.0: driver max reduction 5.95 dB
+  PASS driver (esll) is really limiting beyond the dead zone (5.95 dB > offset+1)
+  PASS t2: follower block-end reduction = ratio*max(0,A_drv(k-1)-offset) within 0.00 dB (worst 1.78e-15 dB over 561 blocks)
+    t2: driver first >0.1 dB in block 187, follower in block 188 -> lag 1 block(s) = 5.3 ms @ 192000 Hz
+  PASS follower gain never > 1 (max 1.000000)
+  PASS link_faults = 0 (0)
+t2 rate=48000 mode=thr ratio=1.00 offset=0.0: driver max reduction 5.95 dB
+  PASS driver (esll) is really limiting beyond the dead zone (5.95 dB > offset+1)
+  PASS t2: follower block-end reduction = ratio*max(0,A_drv(k-1)-offset) within 0.00 dB (worst 1.33e-15 dB over 139 blocks)
+    t2: driver first >0.1 dB in block 46, follower in block 47 -> lag 1 block(s) = 21.3 ms @ 48000 Hz
+  PASS follower gain never > 1 (max 1.000000)
+  PASS link_faults = 0 (0)
+t5 rate=48000 mode=seq ratio=0.50 offset=0.0: driver max reduction 5.95 dB
+  PASS driver (esll) is really limiting beyond the dead zone (5.95 dB > offset+1)
+  PASS t5: follower block-end reduction = ratio*max(0,A_drv(k-1)-offset) within 0.00 dB (worst 2.22e-15 dB over 139 blocks)
+    t5: driver first >0.1 dB in block 46, follower in block 47 -> lag 1 block(s) = 21.3 ms @ 48000 Hz
+  PASS follower gain never > 1 (max 1.000000)
+  PASS link_faults = 0 (0)
+t5 rate=192000 mode=seq ratio=0.50 offset=0.0: driver max reduction 5.95 dB
+  PASS driver (esll) is really limiting beyond the dead zone (5.95 dB > offset+1)
+  PASS t5: follower block-end reduction = ratio*max(0,A_drv(k-1)-offset) within 0.00 dB (worst 1.78e-15 dB over 561 blocks)
+    t5: driver first >0.1 dB in block 187, follower in block 188 -> lag 1 block(s) = 5.3 ms @ 192000 Hz
+  PASS follower gain never > 1 (max 1.000000)
+  PASS link_faults = 0 (0)
+t4 rate=48000 mode=seq ratio=1.00 offset=0.0: driver max reduction 5.95 dB
+  PASS driver (esll) is really limiting beyond the dead zone (5.95 dB > offset+1)
+  PASS t4: follower block-end reduction = ratio*max(0,A_drv(k-1)-offset) within 0.00 dB (worst 1.33e-15 dB over 139 blocks)
+    t4: driver first >0.1 dB in block 46, follower in block 47 -> lag 1 block(s) = 21.3 ms @ 48000 Hz
+  PASS follower gain never > 1 (max 1.000000)
+  PASS link_faults = 0 (0)
+t4 rate=48000 mode=seq ratio=1.00 offset=2.0: driver max reduction 5.95 dB
+  PASS driver (esll) is really limiting beyond the dead zone (5.95 dB > offset+1)
+  PASS t4: follower block-end reduction = ratio*max(0,A_drv(k-1)-offset) within 0.00 dB (worst 2.66e-15 dB over 139 blocks)
+    t4: driver first >0.1 dB in block 46, follower in block 47 -> lag 1 block(s) = 21.3 ms @ 48000 Hz
+  PASS follower gain never > 1 (max 1.000000)
+  PASS link_faults = 0 (0)
+t4 rate=48000 mode=seq ratio=1.00 offset=2.0: driver max reduction 1.49 dB
+  PASS driver limits 1.49 dB, inside the 2.0 dB dead zone -> follower untouched (min gain 1.000000)
+  PASS t4: follower block-end reduction = ratio*max(0,A_drv(k-1)-offset) within 0.00 dB (worst 0.00e+00 dB over 139 blocks)
+  PASS follower gain never > 1 (max 1.000000)
+  PASS link_faults = 0 (0)
+
+-- T3 drive subset: alkoven over its own limit does not pull esll --
+T3 rate=48000 blocks=93
+  PASS alkoven is limited by its own limit in 93 blocks
+  PASS esll bit-identical to the no-link run (0 blocks differ) - alkoven does not drive
+
+-- T7 threads: seq == thr (pthread barrier) == sem (bfrun-like), faults 0; TSan --
+  PASS T7 live_alk_link thr 100000 blocks: hash 3c4a4b232f88014c == seq, link_faults 0
+  PASS T7 live_alk_link sem 100000 blocks: hash 3c4a4b232f88014c == seq, link_faults 0
+  PASS T7 ok_design_D thr 100000 blocks: hash 2aa7d932c34b4dea == seq, link_faults 0
+  PASS T7 ok_design_D sem 100000 blocks: hash 2aa7d932c34b4dea == seq, link_faults 0
+  PASS T7 TSan thr 100000 blocks: 0 reports, hash identical (64.58s)
+  PASS T7 TSan sem 100000 blocks: 0 reports, hash identical (65.21s)
+  PASS T7 realsize=4 (float) live_alk_link thr 20000 blocks: hash 0424a2b91090a52e == seq, link_faults 0
+  PASS T7 realsize=4 (float) live_alk_link sem 20000 blocks: hash 0424a2b91090a52e == seq, link_faults 0
+
+-- T10b lmc output with links: JSON valid, link fields present --
+  PASS T10b lmc json with links parses (25 9 ['alkoven', 'esll', 'eslr'] True)
+  PASS T10b lmc link list/off/on: state shown, unknown name reported
+
+-- T8 real time: no malloc/printf in output_timed; cost per block --
+T8 /mnt/c/Users/micha/.wmux/company-worktrees/e7038400f4ed/dev-2-06bd9b7d/protect-link/tests/cfg/live_alk_link.txt rate=192000 blocks=20000: output_timed mean per channel and block: subl=14.60us subr=14.61us esll=9.86us eslr=9.85us alkoven=12.40us (block time 5.33 ms)
+T8TIME subl 14.5978
+T8TIME subr 14.6123
+T8TIME esll 9.8562
+T8TIME eslr 9.8527
+T8TIME alkoven 12.4037
+  PASS no malloc/calloc/realloc/free/printf-family/fwrite/write inside output_timed (0 calls)
+T8 /mnt/c/Users/micha/.wmux/company-worktrees/e7038400f4ed/dev-2-06bd9b7d/protect-link/tests/cfg/live_alk_nolink.txt rate=192000 blocks=20000: output_timed mean per channel and block: subl=14.48us subr=14.53us esll=8.98us eslr=9.04us alkoven=11.61us (block time 5.33 ms)
+T8TIME subl 14.4806
+T8TIME subr 14.5294
+T8TIME esll 8.9753
+T8TIME eslr 9.0370
+T8TIME alkoven 11.6064
+  PASS no malloc/calloc/realloc/free/printf-family/fwrite/write inside output_timed (0 calls)
+  PASS T8 192000 Hz: extra cost of the link per linked channel and block max 0.88 us (same channel, link vs no link) < 1% of the block time 5333 us
+T8 /mnt/c/Users/micha/.wmux/company-worktrees/e7038400f4ed/dev-2-06bd9b7d/protect-link/tests/cfg/live_alk_link.txt rate=48000 blocks=20000: output_timed mean per channel and block: subl=14.75us subr=14.55us esll=10.03us eslr=9.96us alkoven=12.49us (block time 21.33 ms)
+T8TIME subl 14.7532
+T8TIME subr 14.5472
+T8TIME esll 10.0282
+T8TIME eslr 9.9575
+T8TIME alkoven 12.4878
+  PASS no malloc/calloc/realloc/free/printf-family/fwrite/write inside output_timed (0 calls)
+T8 /mnt/c/Users/micha/.wmux/company-worktrees/e7038400f4ed/dev-2-06bd9b7d/protect-link/tests/cfg/live_alk_nolink.txt rate=48000 blocks=20000: output_timed mean per channel and block: subl=14.62us subr=14.40us esll=9.15us eslr=9.11us alkoven=11.69us (block time 21.33 ms)
+T8TIME subl 14.6198
+T8TIME subr 14.4021
+T8TIME esll 9.1527
+T8TIME eslr 9.1111
+T8TIME alkoven 11.6931
+  PASS no malloc/calloc/realloc/free/printf-family/fwrite/write inside output_timed (0 calls)
+  PASS T8 48000 Hz: extra cost of the link per linked channel and block max 0.88 us (same channel, link vs no link) < 1% of the block time 21333 us
+  PASS T8 objdump protect.bflogic: call graph of output_timed [output_timed __stack_chk_fail detect_sample log10 pow] reaches only external [__stack_chk_fail log10 pow]
+
+-- T9 fault injection (NaN, 0, 2.0, wrong block) --
+T9 inject NaN      : faults=1 alkoven gain block 56 end 1.0000 (prev 0.5039)
+  PASS inject NaN: counted, partner ignored, own limits only (gain 1.000000)
+  PASS inject NaN: follower gain stays in (0,1]
+T9 inject 0.0      : faults=1 alkoven gain block 56 end 1.0000 (prev 0.5039)
+  PASS inject 0.0: counted, partner ignored, own limits only (gain 1.000000)
+  PASS inject 0.0: follower gain stays in (0,1]
+T9 inject 2.0      : faults=1 alkoven gain block 56 end 1.0000 (prev 0.5039)
+  PASS inject 2.0: counted, partner ignored, own limits only (gain 1.000000)
+  PASS inject 2.0: follower gain stays in (0,1]
+T9 inject wrong blk: faults=1 alkoven gain block 56 end 0.5000 (prev 0.5039)
+  PASS inject wrong blk: counted, conservative min of both slots used (0.5000 = min(0.5 stale, 0.5039 current))
+  PASS inject wrong blk: follower gain stays in (0,1]
+
+-- T10 lmc link off/on during a burst --
+T10 rate=48000 mode=seq off@60 on@75
+  PASS before off: alkoven follows (-5.95 dB)
+  PASS link off: from the very next block only own limits (gain exactly 1.0 in blocks 60..74)
+  PASS link on: ramp starts at 1.0 (first sample 0.999516, end 0.503894 = partner 0.503894), no jump
+LINK          STATE  CHANNEL       ROLE    RATIO  OFFSET    LINK_dB   FAULTS
+alk_fill      ON     esll          drive    1.00     0.0       0.00        0
+alk_fill      ON     alkoven       follow   1.00     0.0      -0.46        0
+T10 rate=48000 mode=thr off@60 on@75
+  PASS before off: alkoven follows (-5.95 dB)
+  PASS link off: from the very next block only own limits (gain exactly 1.0 in blocks 60..74)
+  PASS link on: ramp starts at 1.0 (first sample 0.999516, end 0.503894 = partner 0.503894), no jump
+LINK          STATE  CHANNEL       ROLE    RATIO  OFFSET    LINK_dB   FAULTS
+alk_fill      ON     esll          drive    1.00     0.0       0.00        0
+alk_fill      ON     alkoven       follow   1.00     0.0      -0.46        0
+
+-- T11 release ramp without steps --
+T11 rate=48000: alkoven max reduction 11.93 dB, max per-sample step at block boundary 7.196e-04
+  PASS deep reduction reached (11.93 dB)
+  PASS every per-sample step (incl. block boundaries) <= |dL|/block_length (linear ramp, no stairs)
+T11 rate=192000: alkoven max reduction 11.93 dB, max per-sample step at block boundary 7.196e-04
+  PASS deep reduction reached (11.93 dB)
+  PASS every per-sample step (incl. block boundaries) <= |dL|/block_length (linear ramp, no stairs)
+
+[tests] 186 PASS, 0 FAIL
+
+[run_tests] RESULT: ALL PASS
+rc=0

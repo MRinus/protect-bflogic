@@ -1,0 +1,143 @@
+# live protect block + TEST alkoven group + link esl_main (design example C)
+    output_scale: 2147483647.0;
+    # KRITISCH, siehe logic/protect/CLAUDE.md "Software-Trockentest":
+    # BruteFIRs Puffer an der output_timed()-Stelle ist bei S32_LE nicht
+    # auf +-1.0 normiert, sondern roh in Integer-Einheiten (+-2^31).
+
+    chain: "mytek_direct_xlr" {
+        dac_max_output_vrms: 6.91;  # reverted to original factory-jumper calibration (FIXED -15dBFS), 2026-08-25 -- new UB 20th-order XO/REW correction needs the headroom back
+        {
+            gain_db: 36.6;
+            # Sabaj A20a BTL Spannungsgain -- MEASURED 2026-08-27 (REW THD
+            # sweep campaign: 4.686Vrms @ -40dBFS/30Hz, back-derived
+            # against DAC output voltage). Replaces old PROVISIONAL
+            # web-sourced estimate (gain_db: 38.8, kein Handbuchwert).
+        };
+    };
+
+    chain: "mytek_via_rca_adapter" {
+        dac_max_output_vrms: 6.91;  # reverted to original factory-jumper calibration (FIXED -15dBFS), 2026-08-25 -- new UB 20th-order XO/REW correction needs the headroom back
+        {
+            gain_db: -6.0;
+            # Stage 1: passive XLR->RCA adapter plug, 2026-08-27.
+            # Balanced-to-single-ended conversion loses 6dB relative to
+            # the differential dac_max_output_vrms reference - was
+            # wrongly assumed lossless (gain_db: 0.0) at first.
+        };
+        {
+            gain_db: 30.5;
+            # Stage 2: TRI 88 Signature Main-In-Gain - CORRECTED
+            # 2026-08-27 same day as measurement: originally computed
+            # as 24.5dB assuming stage 1 = 0dB; with the real -6dB
+            # adapter loss accounted for, TRI's own gain is 6dB higher
+            # to produce the same measured 8.52Vrms @ -22.68dBFS/80Hz
+            # output. Cumulative gain through this stage (-6.0+30.5=
+            # 24.5dB) is unchanged, still matches the original
+            # end-to-end measurement - bookkeeping-only correction.
+        };
+        { gain_db: 35.6; };   # Stage 3: ESL-eigener 1:60-Step-up-Uebertrager, unchanged
+    };
+
+    group: {
+        channels: "subl", "subr";
+        chain: "mytek_direct_xlr";
+
+        limit: {
+            name: "amp_clip"; max_vrms: 52.89; type: "peak";
+            attack_ms: 0.3; release_ms: 200.0;
+            always_on: 1;
+        };
+
+        limit: {
+            name: "driver_thermal"; max_vrms: 136.33; type: "rms";
+            window_ms: 500.0; rms_release_ms: 2000.0;
+            always_on: 1;
+        };
+
+        limit: {
+            name: "xmax_a"; max_vrms: 16.8; type: "peak";
+            ref_freq_hz: 39.04; slope_db_oct: 12.0;
+            attack_ms: 0.3; release_ms: 200.0;
+            weighting: "signed";
+            enabled: 1;
+        };
+
+        limit: {
+            name: "xmax_a14"; max_vrms: 14.0; type: "peak";
+            ref_freq_hz: 39.04; slope_db_oct: 12.0;
+            attack_ms: 0.3; release_ms: 200.0;
+            weighting: "signed";
+            enabled: 0;
+        };
+
+        limit: {
+            name: "thd_b1"; max_vrms: 0.08; type: "peak";
+            ref_freq_hz: 3.0; slope_db_oct: 12.0;
+            attack_ms: 1.0; release_ms: 200.0;
+            weighting: "signed";
+            enabled: 0;
+        };
+
+        limit: {
+            name: "thd_b2"; max_vrms: 2.17; type: "peak";
+            ref_freq_hz: 24.0; slope_db_oct: 12.0;
+            attack_ms: 1.0; release_ms: 200.0;
+            weighting: "signed";
+            enabled: 0;
+        };
+
+        limit: {
+            name: "old_thd_2pct"; max_vrms: 6.68; type: "peak";
+            ref_freq_hz: 39.04; slope_db_oct: 12.0;
+            attack_ms: 1.0; release_ms: 200.0;
+            enabled: 0;
+        };
+
+        limit: {
+            name: "old_xmax"; max_vrms: 16.8; type: "peak";
+            ref_freq_hz: 39.04; slope_db_oct: 12.0;
+            attack_ms: 1.0; release_ms: 200.0;
+            enabled: 0;
+        };
+    };
+
+    group: {
+        channels: "esll", "eslr";
+        chain: "mytek_via_rca_adapter";
+
+        limit: {
+            name: "stepup_1_60_thd_2pct"; max_vrms: 971.0; type: "peak";
+            ref_freq_hz: 80.0; slope_db_oct: 6.0;
+            attack_ms: 0.5; release_ms: 300.0;
+        };
+
+        limit: {
+            name: "tri_rated_power"; max_vrms: 33.46; type: "peak";
+            attack_ms: 0.5; release_ms: 300.0;
+            stage: 2;
+        };
+
+        limit: {
+            name: "els_xmax"; max_vrms: 2500.0; type: "peak";
+            attack_ms: 0.5; release_ms: 300.0;
+        };
+    };
+
+# --- TEST ONLY: alkoven chain/group with test numbers (NOT proposal values) ---
+    chain: "test_nc400" {
+        dac_max_output_vrms: 6.91;
+        { gain_db: 26.0; };
+    };
+    group: {
+        channels: "alkoven";
+        chain: "test_nc400";
+        limit: { name: "alk_amp_clip"; max_vrms: 60.0; type: "peak"; attack_ms: 0.3; release_ms: 200.0; always_on: 1; };
+        limit: { name: "alk_thermal"; max_vrms: 25.0; type: "rms"; window_ms: 500.0; rms_release_ms: 2000.0; always_on: 1; };
+        limit: { name: "alk_dc_infra"; max_vrms: 2.0; type: "peak"; ref_freq_hz: 15.0; slope_db_oct: 12.0; weighting: "signed"; attack_ms: 0.3; release_ms: 200.0; enabled: 1; };
+    };
+
+    link: "esl_main" {
+        channels: "esll", "eslr", "alkoven";
+        drive: "esll", "eslr";
+        ratio: 1.0, 1.0, 1.0;
+    };

@@ -183,6 +183,59 @@ count is easy to misread as "N separate incidents" rather than elapsed
 time) and `gain` (the current smoothed gain reduction, linear and in
 dB — `1.000`/`0.00dB` means no reduction right now).
 
+## Channel link (offline, 08.11.2026 — NOT deployed)
+
+Design: architect `8a51a27`, "protect Channel-Link Design (08.11.2026)",
+stage 1. Implementation and tests: this directory (dev-2,
+task-2dd1772b). A link couples the gain REDUCTION of output channels
+across groups, e.g. so that the alkoven fill follows the left ESL by the
+same dB when the ESL is being limited:
+
+```
+link: "alk_fill" {
+    channels: "esll", "alkoven";   # 2..8 members, each in exactly one group
+    drive: "esll";                 # optional subset; default: all drive
+    ratio: 1.0, 1.0;               # optional, per member, 0..1 (dB scale)
+    offset_db: 0.0, 0.0;           # optional, per member, 0..40 dB dead zone
+    enabled: 1;                    # optional; runtime: lmc protect link on|off
+};
+```
+
+- Each member keeps its own limits unchanged; additionally it applies
+  `min(own gain, 10^(-ratio*max(0, A_partner_dB - offset)/20))`, where
+  `A_partner` is the reduction of the driving partners in the PREVIOUS
+  block. A link can only reduce more, never less (invariant
+  `|y_link| <= |y_nolink|`, tested sample-exact).
+- Lock-free: two parity slots per channel, ordered by BruteFIR's per-block
+  barrier between filter threads (`synch_filter_processes`); relaxed
+  atomics. Follower lag 1 block (23 ms @ 44.1 kHz ... 5.3 ms @ 192 kHz),
+  linear ramp over the block, no steps.
+- Config errors abort the start (`preinit` -1 → BruteFIR
+  `BF_EXIT_INVALID_CONFIG`): unknown/duplicate names, member without
+  group, channel in two links, drive not a member, length/range of
+  ratio/offset, unknown/duplicate fields, more than 4 links or 8 members.
+  **New also without links:** a channel in two `group`s is now a config
+  error (it used to overwrite the first mapping silently).
+- Without any `link` block the processing path, the startup log and every
+  `lmc` output are byte-identical to the deployed v3 module (test T1b).
+- `lmc <idx> link [list]`, `link on <name>|all`, `link off <name>|all`
+  (off removes only the additional reduction, so it is always allowed);
+  status table and JSON get link fields only when links exist.
+
+Tests (Linux; from Git Bash it re-runs itself in WSL):
+
+```sh
+bash tests/run_tests.sh      # build (-Wall -Wextra), harness, T1..T11, TSan
+```
+
+`tests/harness.c` includes the module source and emulates BruteFIR around
+it (token stream, preinit/init, output_timed per channel and block) in
+three modes: sequential, one thread per channel with a pthread barrier,
+and with semaphores exactly like `bfrun.c synch_filter_processes`.
+`tests/make_cfgs.py` writes the configs in `tests/cfg/` (committed).
+Stage 2 (one-block lookahead, sample-exact link) is only documented in the
+design, not implemented.
+
 ## Testing
 
 `tests/` has a software-only dry-test setup: synthetic tones at known

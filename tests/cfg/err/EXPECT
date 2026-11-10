@@ -1,0 +1,23 @@
+dup_link_name	link name 'a' used twice
+one_member	at least 2 members
+too_many_members	too many entries (max 8)
+too_many_links	too many links (max 4)
+unknown_output	'esl_l' is not a BruteFIR output channel
+member_no_group	'alkoven' is in no protect group
+chan_two_groups	'esll' is in more than one group
+chan_two_groups_same	'subl' is in more than one group
+chan_two_links	'esll' is in more than one link
+dup_member	'esll' listed twice
+drive_not_member	drive 'eslr' is not a member
+drive_dup	drive 'esll' listed twice
+ratio_len	ratio has 1 entries, channels has 2
+offset_len	offset_db has 3 entries, channels has 2
+ratio_high	ratio 1.5 for 'alkoven' out of range
+ratio_neg	ratio -0.1 for 'esll' out of range
+offset_high	offset_db 41 for 'alkoven' out
+offset_neg	offset_db -1 for 'esll' out
+unknown_field	unknown field 'gain'
+field_twice	field 'channels' given twice
+empty_name	empty or too long link name
+no_channels	at least 2 members (got 0)
+ratio_not_number	ratio: expected number
