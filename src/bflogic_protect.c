@@ -104,6 +104,7 @@
 #define MAX_GROUPS 8
 #define MAX_CH_PER_GROUP 4
 #define MAX_LIMITS_PER_GROUP 8
+#define MAX_MAPPED_CHANNELS_LA 64   /* == MAX_MAPPED_CHANNELS, defined before use */
 
 #define LIMIT_PEAK 0
 #define LIMIT_RMS  1
@@ -194,6 +195,41 @@ static struct channel_runtime ch_runtime[MAX_GROUPS][MAX_CH_PER_GROUP];
    isn't silently wrong if a config ever uses a different sample
    format. */
 static double output_scale = 2147483647.0;
+
+/* ---- Lookahead (stage 2a, 2026-11-17) ------------------------------------
+   Optional top-level "lookahead_ms: <real>;" (default 0 = off, the v3/link
+   path is then byte-identical). With L = D+1, D = round(lookahead_ms*fs):
+   - EVERY output channel the module sees is delayed by D samples (mapped
+     or not), so the time alignment between all outputs is kept;
+   - each PEAK limit computes its instantaneous required gain
+     r[n] = thr/|detect[n]| (1 if below), takes the sliding minimum over the
+     last L samples and box-averages that minimum over L samples. Every
+     average at time n only contains minima whose window includes sample
+     n-D, so avg[n] <= r[n-D]: the gain applied to the delayed sample is
+     never above what that sample needs (no overshoot, sample-exact for
+     unweighted limits), and it ramps down linearly over D samples ahead of
+     the peak instead of reacting after it. A release smoother can only
+     slow increases; a final min(g, r[n-D]) absorbs rounding.
+   - attack_ms is not used by peak limits in this mode (the ramp is D).
+   - weighted limits (ref_freq_hz/slope) run the same scheme on their
+     weighted detector; because the gain acts before the weighting filter
+     in reality, the bound there is close but not exact (offline test).
+   - RMS limits keep their v3 smoothing; their gain is applied to the
+     delayed sample (D is far below their time constants). */
+#define LA_MAX_MS 10.0
+static double lookahead_ms = 0.0;
+static int    la_L = 0;                    /* 0 = lookahead off */
+struct la_state {                          /* one per [group][ch][limit] */
+    double *rring;                         /* r[], L */
+    double *mring;                         /* window minima, L */
+    double *dq_val;                        /* monotonic deque, L */
+    long   *dq_idx;
+    int     dq_head, dq_cnt;
+    double  sum;                           /* sum of mring */
+};
+static struct la_state *la_st;             /* [MAX_GROUPS][MAX_CH][MAX_LIM] */
+static double *la_dly[MAX_MAPPED_CHANNELS_LA];  /* audio delay ring, L */
+static long    la_n[MAX_MAPPED_CHANNELS_LA];    /* samples seen per channel */
 
 static int sample_rate;
 static int block_length;
@@ -958,6 +994,142 @@ detect_sample(struct group *g, struct channel_runtime *rt, double s)
     return combined;
 }
 
+static inline struct la_state *
+la_get(int gi, int ci, int l)
+{
+    return &la_st[(gi * MAX_CH_PER_GROUP + ci) * MAX_LIMITS_PER_GROUP + l];
+}
+
+/* Weighted detector magnitude of one sample (same code as detect_sample). */
+static inline double
+weighted_mag(struct limit_cfg *lc, struct limit_state *ls, double s)
+{
+    double d;
+    if (!lc->freq_weighted) return fabs(s);
+    if (lc->signed_weight) {
+        ls->shelf_z1 = (1.0 - lc->shelf_coeff) * s + lc->shelf_coeff * ls->shelf_z1;
+        d = ls->shelf_z1;
+        if (lc->shelf_poles == 2) {
+            ls->shelf_z2 = (1.0 - lc->shelf_coeff) * d + lc->shelf_coeff * ls->shelf_z2;
+            d = ls->shelf_z2;
+        }
+        return fabs(d);
+    }
+    ls->shelf_z1 = (1.0 - lc->shelf_coeff) * fabs(s) + lc->shelf_coeff * ls->shelf_z1;
+    d = ls->shelf_z1;
+    if (lc->shelf_poles == 2) {
+        ls->shelf_z2 = (1.0 - lc->shelf_coeff) * d + lc->shelf_coeff * ls->shelf_z2;
+        d = ls->shelf_z2;
+    }
+    return d;
+}
+
+/* Lookahead detector: input sample s (time n = sample counter k), returns
+   the combined gain for the sample of time n-D. */
+static inline double
+detect_sample_la(struct group *g, struct channel_runtime *rt, int gi, int ci,
+                 double s, long k)
+{
+    const int L = la_L;
+    const int p = (int)(k % L);
+    const int pd = (p + 1 == L) ? 0 : p + 1;
+    double combined = 1.0;
+
+    for (int l = 0; l < g->n_limits; l++) {
+        struct limit_cfg *lc = &g->limits[l];
+        struct limit_state *ls = &rt->st[l];
+        struct la_state *la = la_get(gi, ci, l);
+        double target, alpha;
+
+        if (!lc->enabled) {
+            ls->gain = 1.0;
+            continue;
+        }
+        if (lc->type == LIMIT_RMS) {        /* unchanged v3 smoothing */
+            ls->rms_sumsq += (s * s - ls->rms_sumsq) * (1.0 / lc->window_samples);
+            if (ls->rms_sumsq > lc->threshold_lin * lc->threshold_lin) {
+                target = sqrt((lc->threshold_lin * lc->threshold_lin) / ls->rms_sumsq);
+                ls->overs++;
+            } else {
+                target = 1.0;
+            }
+            alpha = (target < ls->gain) ? lc->attack_coeff : lc->release_coeff;
+            ls->gain = target + alpha * (ls->gain - target);
+            if (ls->gain < combined) combined = ls->gain;
+            continue;
+        }
+
+        double mag = weighted_mag(lc, ls, s);
+        double r = (mag > lc->threshold_lin) ? (lc->threshold_lin / mag) : 1.0;
+        if (r < 0.999) ls->overs++;
+
+        /* sliding minimum over the last L r-values (monotonic deque).
+           Drop the entry that left the window FIRST, so the deque never
+           holds more than L entries. */
+        while (la->dq_cnt > 0 && la->dq_idx[la->dq_head] <= k - L) {
+            la->dq_head = (la->dq_head + 1 == L) ? 0 : la->dq_head + 1;
+            la->dq_cnt--;
+        }
+        while (la->dq_cnt > 0) {
+            int b = la->dq_head + la->dq_cnt - 1;
+            if (b >= L) b -= L;
+            if (la->dq_val[b] >= r) la->dq_cnt--; else break;
+        }
+        {
+            int b = la->dq_head + la->dq_cnt;
+            if (b >= L) b -= L;
+            la->dq_val[b] = r;
+            la->dq_idx[b] = k;
+            la->dq_cnt++;
+        }
+        double m = la->dq_val[la->dq_head];
+
+        /* box average of the minima over L samples */
+        la->sum += m - la->mring[p];
+        la->mring[p] = m;
+        if (p == L - 1) {                   /* re-sum once per L: no drift */
+            double t = 0.0;
+            for (int j = 0; j < L; j++) t += la->mring[j];
+            la->sum = t;
+        }
+        la->rring[p] = r;
+        double r_del = la->rring[pd];       /* r of the delayed sample n-D */
+        double avg = la->sum / (double)L;
+
+        /* release only slows increases; never above avg or r_del */
+        double gg = (avg < ls->gain) ? avg
+                    : avg + lc->release_coeff * (ls->gain - avg);
+        if (gg > r_del) gg = r_del;
+        ls->gain = gg;
+        if (gg < combined) combined = gg;
+    }
+    return combined;
+}
+
+/* Audio delay by D = L-1 samples (lookahead). */
+static inline double
+la_delay(int channel, double s, long k)
+{
+    const int L = la_L;
+    const int p = (int)(k % L);
+    double *d = la_dly[channel];
+    d[p] = s;
+    return d[(p + 1 == L) ? 0 : p + 1];
+}
+
+static inline void
+process_channel_la(struct group *g, int gi, int ci, int channel,
+                   double *samples, int n)
+{
+    struct channel_runtime *rt = &ch_runtime[gi][ci];
+    for (int i = 0; i < n; i++) {
+        long k = la_n[channel]++;
+        double s = samples[i];
+        double gn = detect_sample_la(g, rt, gi, ci, s, k);
+        samples[i] = la_delay(channel, s, k) * gn;
+    }
+}
+
 static inline void
 process_channel(struct group *g, int gi, int ci, double *samples, int n)
 {
@@ -977,8 +1149,8 @@ process_channel(struct group *g, int gi, int ci, double *samples, int n)
    block (published to the partners - never the linked gain, design 2.3
    point 2, otherwise symmetric links latch). */
 static inline double
-process_channel_link(struct group *g, int gi, int ci, double *samples,
-                     int n, double L_prev, double L_tgt)
+process_channel_link(struct group *g, int gi, int ci, int channel,
+                     double *samples, int n, double L_prev, double L_tgt)
 {
     struct channel_runtime *rt = &ch_runtime[gi][ci];
     double own_min = 1.0;
@@ -986,7 +1158,14 @@ process_channel_link(struct group *g, int gi, int ci, double *samples,
 
     for (int i = 0; i < n; i++) {
         double s = samples[i];
-        double combined = detect_sample(g, rt, s);
+        double combined;
+        if (la_L > 0) {
+            long k = la_n[channel]++;
+            combined = detect_sample_la(g, rt, gi, ci, s, k);
+            s = la_delay(channel, s, k);
+        } else {
+            combined = detect_sample(g, rt, s);
+        }
         if (combined < own_min) own_min = combined;
         double L_i = L_prev + dL * (double)(i + 1) / (double)n;
         /* NaN-safe: a NaN L_i compares false -> own gain is applied */
@@ -1043,9 +1222,22 @@ output_timed(void *buf, int channel)
     float *fbuf = NULL;
     int n = block_length;
 
-    if (channel < 0 || channel >= MAX_MAPPED_CHANNELS ||
-        chan_group[channel] < 0)
-    {
+    if (channel < 0 || channel >= MAX_MAPPED_CHANNELS) {
+        return;
+    }
+    if (chan_group[channel] < 0) {
+        if (la_L > 0) {          /* keep alignment: unmapped outputs delayed too */
+            for (int i = 0; i < n; i++) {
+                long k = la_n[channel]++;
+                if (realsize == 4) {
+                    float *f = (float *)buf;
+                    f[i] = (float)la_delay(channel, f[i], k);
+                } else {
+                    double *d = (double *)buf;
+                    d[i] = la_delay(channel, d[i], k);
+                }
+            }
+        }
         return;
     }
     gi = chan_group[channel];
@@ -1061,8 +1253,12 @@ output_timed(void *buf, int channel)
 
     li = chan_link[channel];
     if (li < 0) {
-        /* no link: unchanged v3 path */
-        process_channel(&groups[gi], gi, ci, samples, n);
+        /* no link: unchanged v3 path (or lookahead) */
+        if (la_L > 0) {
+            process_channel_la(&groups[gi], gi, ci, channel, samples, n);
+        } else {
+            process_channel(&groups[gi], gi, ci, samples, n);
+        }
     } else {
         struct link_cfg *lk = &links[li];
         long k = ++blk_ctr[channel];
@@ -1073,8 +1269,8 @@ output_timed(void *buf, int channel)
         } else {
             L_prev = 1.0;        /* link off: immediately own limits only */
         }
-        double own_min = process_channel_link(&groups[gi], gi, ci, samples,
-                                              n, L_prev, L_tgt);
+        double own_min = process_channel_link(&groups[gi], gi, ci, channel,
+                                              samples, n, L_prev, L_tgt);
         link_prev[channel] = L_tgt;
         a_store_d(&link_now[channel], L_tgt);
         struct pub_slot *w = &pub[channel][k & 1];      /* always publish */
@@ -1163,6 +1359,15 @@ bflogic_preinit(/* bfmod.h names these (version_minor, version_major, ...),
             GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
             output_scale = lexval.real;
             GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
+        } else if (strcmp(lexval.field, "lookahead_ms") == 0) {
+            GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
+            lookahead_ms = lexval.real;
+            GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
+            if (!(lookahead_ms >= 0.0 && lookahead_ms <= LA_MAX_MS)) {
+                fprintf(stderr, "PROTECT: lookahead_ms must be 0..%.0f, "
+                        "got %g.\n", LA_MAX_MS, lookahead_ms);
+                return -1;
+            }
         } else if (strcmp(lexval.field, "link") == 0) {
             char link_name[BF_MAXOBJECTNAME];
             GET_TOKEN(BF_LEXVAL_STRING, "expected link name string.\n");
@@ -1185,8 +1390,9 @@ bflogic_preinit(/* bfmod.h names these (version_minor, version_major, ...),
             GET_TOKEN(BF_LEX_EOS, "expected ';' after link block.\n");
             n_links++;
         } else {
-            fprintf(stderr, "PROTECT: expected 'chain', 'group', 'link' or "
-                    "'output_scale', got '%s'.\n", lexval.field);
+            fprintf(stderr, "PROTECT: expected 'chain', 'group', 'link', "
+                    "'output_scale' or 'lookahead_ms', got '%s'.\n",
+                    lexval.field);
             return -1;
         }
     }
@@ -1251,9 +1457,61 @@ bflogic_preinit(/* bfmod.h names these (version_minor, version_major, ...),
         return -1;
     }
 
+    if (lookahead_ms > 0.0) {
+        long D = lround(lookahead_ms * sample_rate / 1000.0);
+        if (D >= 1) {
+            la_L = (int)D + 1;
+            size_t ns = (size_t)MAX_GROUPS * MAX_CH_PER_GROUP * MAX_LIMITS_PER_GROUP;
+            la_st = calloc(ns, sizeof(*la_st));
+            if (la_st == NULL) { fprintf(stderr, "PROTECT: out of memory.\n"); return -1; }
+            for (int g = 0; g < n_groups; g++)
+              for (c = 0; c < groups[g].n_channels; c++)
+                for (int l = 0; l < groups[g].n_limits; l++) {
+                    struct la_state *la = la_get(g, c, l);
+                    la->rring = malloc(la_L * sizeof(double));
+                    la->mring = malloc(la_L * sizeof(double));
+                    la->dq_val = malloc(la_L * sizeof(double));
+                    la->dq_idx = malloc(la_L * sizeof(long));
+                    if (!la->rring || !la->mring || !la->dq_val || !la->dq_idx) {
+                        fprintf(stderr, "PROTECT: out of memory.\n");
+                        return -1;
+                    }
+                }
+            for (i = 0; i < MAX_MAPPED_CHANNELS; i++) {
+                la_dly[i] = calloc(la_L, sizeof(double));
+                if (la_dly[i] == NULL) { fprintf(stderr, "PROTECT: out of memory.\n"); return -1; }
+            }
+            fprintf(stderr, "PROTECT: lookahead %.3f ms = %ld samples on "
+                    "every output (peak limits: sliding-min + %d-sample "
+                    "ramp, attack_ms unused)\n", lookahead_ms, D, la_L);
+        }
+    }
+
     bfevents->output_timed = output_timed;
     *fork_mode = BF_FORK_DONT_FORK;
     return 0;
+}
+
+static void
+la_runtime_reset(void)
+{
+    if (la_L <= 0) return;
+    for (int g = 0; g < n_groups; g++)
+      for (int c = 0; c < groups[g].n_channels; c++)
+        for (int l = 0; l < groups[g].n_limits; l++) {
+            struct la_state *la = la_get(g, c, l);
+            for (int j = 0; j < la_L; j++) {
+                la->rring[j] = 1.0;
+                la->mring[j] = 1.0;
+            }
+            la->sum = (double)la_L;
+            la->dq_head = 0;
+            la->dq_cnt = 0;
+        }
+    for (int i = 0; i < MAX_MAPPED_CHANNELS; i++) {
+        memset(la_dly[i], 0, la_L * sizeof(double));
+        la_n[i] = 0;
+    }
 }
 
 static void
@@ -1297,6 +1555,7 @@ bflogic_init(struct bfaccess *bfaccess,
         }
     }
     link_runtime_reset();
+    la_runtime_reset();
     if (n_links > 0) {
         fprintf(stderr, "PROTECT: initialised, %d chain(s), %d group(s), "
                 "%d link(s), realsize=%d\n", n_chains, n_groups, n_links,
