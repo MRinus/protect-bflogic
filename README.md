@@ -297,6 +297,13 @@ Tests (Linux; from Git Bash it re-runs itself in WSL):
 bash tests/run_tests.sh      # build (-Wall -Wextra), harness, T1..T11, TSan
 ```
 
+It needs two reference inputs (see `ref/README.md`): the BruteFIR 1.1.2
+header `bfmod.h` in `ref/bf112/` (not in the repo: BruteFIR is a separate
+project with its own license; copy `src/bfmod.h` from tag v1.1.2, or set
+`BF_INC_DIR`), and `ref/bflogic_protect.deployed.c` (in the repo), the
+deployed module that T1b and the warning diff compare against (override
+with `REF_SRC`). Missing inputs stop the run with exit 2 and a message.
+
 `tests/harness.c` includes the module source and emulates BruteFIR around
 it (token stream, preinit/init, output_timed per channel and block) in
 three modes: sequential, one thread per channel with a pthread barrier,
