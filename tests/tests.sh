@@ -48,8 +48,12 @@ done
 "$H" lmc "$C/live_nolink.txt" 48000 2000 random "" all json list "off xmax_a" "on xmax_a14" reset > "$OUT/lmc_new.txt" 2>/dev/null
 cmp -s "$OUT/lmc_ref.txt" "$OUT/lmc_new.txt" && ok "T1b lmc output (status/all/json/list/off/on/reset) byte-identical ($(wc -c < "$OUT/lmc_new.txt") bytes)" \
   || { bad "T1b lmc output differs"; diff "$OUT/lmc_ref.txt" "$OUT/lmc_new.txt" | head; }
-"$R" preinit "$C/live_nolink.txt" > /dev/null 2> "$OUT/log_ref.txt"; "$H" preinit "$C/live_nolink.txt" > /dev/null 2> "$OUT/log_new.txt"
-cmp -s "$OUT/log_ref.txt" "$OUT/log_new.txt" && ok "T1b startup log byte-identical ($(wc -l < "$OUT/log_new.txt") lines)" || { bad "T1b startup log differs"; diff "$OUT/log_ref.txt" "$OUT/log_new.txt" | head; }
+# Cue-044: src/ logs in English; the reference logs in German. Map the
+# reference log with t1b_log_en.sed, then compare byte for byte.
+"$R" preinit "$C/live_nolink.txt" > /dev/null 2> "$OUT/log_ref_de.txt"; "$H" preinit "$C/live_nolink.txt" > /dev/null 2> "$OUT/log_new.txt"
+sed -f "$HERE/t1b_log_en.sed" "$OUT/log_ref_de.txt" > "$OUT/log_ref.txt"
+cmp -s "$OUT/log_ref_de.txt" "$OUT/log_ref.txt" && bad "T1b text map changed nothing (reference not German any more? update t1b_log_en.sed)"
+cmp -s "$OUT/log_ref.txt" "$OUT/log_new.txt" && ok "T1b startup log byte-identical after the text map ($(wc -l < "$OUT/log_new.txt") lines)" || { bad "T1b startup log differs"; diff "$OUT/log_ref.txt" "$OUT/log_new.txt" | head; }
 
 echo; echo "-- T1a invariant: |y_link| <= |y_nolink| sample-exact, detectors bit-identical --"
 sub "$H" t1a "$C/live_alk_link.txt" "$C/live_alk_nolink.txt" 48000 100000 seq
