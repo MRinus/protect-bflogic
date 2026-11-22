@@ -72,8 +72,9 @@ threshold you calculated by hand.
   #              243.9 V @ 20 Hz, 123.7 V @ 10 Hz
   ```
 
-  Rules: `ref_freq_hz` and `hp_corner_hz` are required, `hp_corner_hz <=
-  ref_freq_hz/4`, and `slope_db_oct` must be omitted or 6.
+  Rules: `type` must be `"peak"`. `ref_freq_hz` and `hp_corner_hz` are
+  required, with `0.1 <= hp_corner_hz <= ref_freq_hz/4`. `slope_db_oct`
+  must be omitted or 6.
   Above `ref_freq_hz` the ceiling rises 6 dB/octave. The ceiling is
   never above that of the 1-pole `ref_freq_hz`/6 dB weighting, at any
   frequency (test I6).
@@ -97,6 +98,20 @@ threshold you calculated by hand.
   | 3000 | 1.8 % | 244.6 V |
 
   All three hold the flux exactly at the ceiling.
+
+  The backstop never makes a sample larger and never flips its sign
+  (test I9, over all runs). The output flux is tracked even while the
+  limit is switched off (`enabled: 0;` or `lmc off`), and it is not
+  reset when the limit is switched on again. So after loud bass with the
+  limit off, `lmc on` can find the flux above the ceiling. The backstop
+  then mutes the channel (gain 0) until the flux has leaked back under
+  the ceiling (time constant `1/(2π·hp_corner_hz)`, 80 ms at 2 Hz; test
+  I8).
+
+  A channel link follows only the smooth gain of its partner, not the
+  backstop. While the backstop acts on an ESL channel, the linked woofer
+  channel is not reduced by the same amount, so for those samples the
+  ESL/woofer balance is briefly off.
 - A limit can reference just the **first N stages of its chain**
   (`stage: N;`, 1-indexed) instead of the full chain — needed when
   several limits in the same group sit at different points along the

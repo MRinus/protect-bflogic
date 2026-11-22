@@ -547,6 +547,18 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
                     "allowed (omit it or give 6).\n", l->name, slope_db_oct);
             return -1;
         }
+        if (l->type == LIMIT_RMS) {
+            fprintf(stderr, "PROTECT: limit '%s': weighting \"integrator\" "
+                    "needs type \"peak\" (the RMS path ignores the "
+                    "weighting).\n", l->name);
+            return -1;
+        }
+        if (hp_corner_hz < 0.1) {
+            fprintf(stderr, "PROTECT: limit '%s': hp_corner_hz %.3f must be "
+                    ">= 0.1 Hz (below that the integrator state needs "
+                    "seconds to forget DC).\n", l->name, hp_corner_hz);
+            return -1;
+        }
         if (hp_corner_hz > ref_freq_hz / 4.0) {
             fprintf(stderr, "PROTECT: limit '%s': hp_corner_hz %.3f must be "
                     "<= ref_freq_hz/4 (%.3f), else the detector is no "
@@ -1030,8 +1042,14 @@ integ_detect(struct limit_cfg *lc, struct limit_state *ls, double s)
    shrinks y towards 0; the bound of an earlier one stays true (it holds
    at y = 0 and at its own y, so on the whole interval between). All
    states are updated with the final y, also of limits switched off by
-   "lmc ... off", so the flux is right when the limit is switched on
-   again. Hot path: no calls, no allocation. */
+   "lmc ... off" or "enabled: 0;", so the flux is right when the limit is
+   switched on again (it is deliberately NOT reset on enable: a reset
+   would forget real flux). Then |P| > F is possible and the induction
+   does not hold for the first samples; the guard below (sec-dude
+   P-020-1) limits y to a gain in [0,1] (0 in the worst case), so the
+   module never makes a sample larger or flips its sign, and the flux
+   falls back under F by the leak (time constant 1/(2*pi*hp_corner_hz),
+   80 ms at 2 Hz). Hot path: no calls, no allocation. */
 static inline void
 flux_backstop(struct group *g, struct channel_runtime *rt, double *samples,
               int n)
@@ -1052,7 +1070,15 @@ flux_backstop(struct group *g, struct channel_runtime *rt, double *samples,
             double p = c * ls->flux_out;
             double q = p + (1.0 - c) * y;
             if (fabs(q) > F) {
-                y = (copysign(F, q) - p) / (1.0 - c);
+                double yn = (copysign(F, q) - p) / (1.0 - c);
+                /* P-020-1 guard: only a gain in [0,1] is allowed. If |P|
+                   > F (state tracked while the limit was off, then "lmc
+                   on"), yn could flip the sign or grow; the best this
+                   sample can do is 0. The flux then decays by c per
+                   sample until the bound holds again. No-op while
+                   |P| <= F. */
+                if (!(yn * y >= 0.0) || fabs(yn) > fabs(y)) yn = 0.0;
+                y = yn;
                 ls->flux_clips++;
             }
         }
