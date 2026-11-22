@@ -104,9 +104,14 @@ sample (0 dBFS = 1.0). So:
 - The real **peak** ceiling at that point is √2 × `max_vrms`, for any
   signal (CALCULATED from the source).
 
-Example (READ, live config 2026-11-21): `max_vrms: 1768` stops the
-stator voltage at about 2500 V peak. `max_vrms: 971` stops it at about
-1373 V peak.
+Example for unweighted limits (READ, live config 2026-11-21):
+`max_vrms: 1768` stops the stator voltage at about 2500 V peak. An
+unweighted `max_vrms: 971` would stop it at about 1373 V peak. For a
+weighted limit the ceiling depends on the frequency and on the detector:
+see [Frequency weighting](#frequency-weighting). Example: the live
+1-pole `"abs"` limit with `max_vrms: 971` at 80 Hz lets an 80 Hz sine
+through up to about 1195 Vrms (MEASURED offline, fundamental at the
+output), not 971 Vrms.
 
 ## Frequency weighting
 
@@ -137,7 +142,8 @@ or 2 (12 dB/octave). The allowed voltage rises with the frequency above
   signal passes the low-pass without attenuation, so the weighting acts
   only at very low frequencies. Example (CALCULATED, holographer
   2026-11-20): a 1-pole `"abs"` limit at 80 Hz has a nearly flat ceiling
-  below 100 Hz. `"abs"` stays the default so that old configs give the
+  below 100 Hz. With `max_vrms: 971` it lets an 80 Hz sine through up to
+  about 1195 Vrms (MEASURED offline). `"abs"` stays the default so that old configs give the
   same result. For new limits, use `"signed"` or `"integrator"`.
 
 `"signed"` needs `ref_freq_hz` and `slope_db_oct`. The module refuses the
@@ -217,9 +223,9 @@ the ceiling. The time constant is `1/(2π·hp_corner_hz)`: 80 ms at 2 Hz
 (CALCULATED; MEASURED offline, test I8).
 
 A channel link follows only the smooth gain of its partner, not the
-backstop. While the backstop acts on an ESL channel, the linked woofer
-channel does not get the same reduction. For those samples the
-ESL/woofer balance is briefly wrong.
+backstop. While the backstop acts on an ESL channel, the linked follower
+channel (live: `alkoven`) does not get the same reduction. For those
+samples the balance between the ESL and the follower is briefly wrong.
 
 ## Lookahead
 
@@ -251,16 +257,17 @@ The startup log shows the lookahead in ms and in samples.
 
 Live since 2026-11-10 (READ, holographer). Design: architect `8a51a27`,
 "protect Channel-Link Design" (2026-11-08), stage 1. A link couples the
-gain *reduction* of output channels across groups. Example: the alcove
-fill follows the ESLs by the same dB when the ESLs are limited.
+gain *reduction* of output channels across groups. The live link (READ,
+holographer 2026-11-22): the alcove channel follows the left ESL by the
+same dB when the left ESL is limited.
 
 ```
-link: "esl_main" {
-    channels: "esll", "eslr", "alkoven";  # 2..8 members, each in exactly one group
-    drive: "esll", "eslr";                # optional subset; default: all members drive
-    ratio: 1.0, 1.0, 1.0;                 # optional, per member, 0..1 (dB scale)
-    offset_db: 0.0, 0.0, 0.0;             # optional, per member, 0..40 dB dead zone
-    enabled: 1;                           # optional; at runtime: lmc protect link on|off
+link: "alk_fill" {
+    channels: "esll", "alkoven";  # 2..8 members, each in exactly one group
+    drive: "esll";                # optional subset; default: all members drive
+    ratio: 1.0, 1.0;              # optional, per member, 0..1 (dB scale)
+    offset_db: 0.0, 0.0;          # optional, per member, 0..40 dB dead zone
+    enabled: 1;                   # optional; at runtime: lmc protect link on|off
 };
 ```
 
@@ -396,7 +403,7 @@ lmc protect                 # status table, idle checkpoints hidden
 lmc protect all             # status table, every checkpoint shown
 lmc protect json            # the same data as a JSON array, for a web UI or script
 lmc protect reset           # set every overs counter to 0 (gain and filter state stay)
-lmc protect list            # every limit: on/off, type, weighting, threshold
+lmc protect list            # every limit: on/off, type, weighting (WEIGHT: abs/signed/integ, "-" = unweighted), threshold
 lmc protect on <name>|all   # switch a limit on (its state is cleared first)
 lmc protect off <name>|all  # switch a limit off (refused, see below)
 lmc protect link [list]     # links and their state
@@ -487,10 +494,10 @@ go of the system owner.**
 | part | state |
 |---|---|
 | protect v1–v3 (chains, groups, peak/RMS, `"abs"` weighting, `stage`, `lmc`) | live since 2026-08-27 (READ) |
-| `weighting: "signed"`, `lmc on/off/list`, `always_on` (v3, fad1221) | live (READ; date OPEN) |
+| `weighting: "signed"`, `lmc on/off/list`, `always_on` (v3, fad1221) | live since 2026-11-01 (READ, holographer commit 0dc3763) |
 | channel link (54ecb2b) | live since 2026-11-10 (READ) |
 | lookahead (a6e7122) | live since 2026-11-17, 1 ms (READ) |
-| `weighting: "integrator"` + flux backstop (Cue-020) | deployed 2026-11-22; the startup check is OPEN (READ) |
+| `weighting: "integrator"` + flux backstop (Cue-020) | live since 2026-11-22 20:37 (READ). Startup log and `lmc list` checked live at 44.1 kHz (MEASURED, holographer); other rates offline in the harness only |
 
 - **Absolute accuracy of the thresholds: not verified with an
   oscilloscope (OPEN).** That check would measure the real output voltage
