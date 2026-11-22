@@ -22,7 +22,8 @@
     record its hash, date and origin here. Then rerun the suite.
 - `bf112/bfmod.h` (NOT in the repo): BruteFIR v1.1.2 module header, from
   `src/bfmod.h` of the BruteFIR repository at tag v1.1.2. BruteFIR is a
-  separate project under its own license, so it is not copied here. Put the
+  separate project (ISC license, like this module), so the header is not
+  copied here; whether to add it is OPEN (the owner decides). Put the
   file at `ref/bf112/bfmod.h` or set `BF_INC_DIR=<dir>`. Also used by
   `tests/check_config.sh` and `tests/integ/integ_tests.sh`.
 
