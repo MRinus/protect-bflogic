@@ -275,10 +275,18 @@ logic: "protect" {
         };
         limit: {
             name: "els_xmax";
-            max_vrms: 2500.0;
-            # Panel's own hard safety backstop -- bias voltage (~2.5kV)
-            # as a practical ceiling for the stator AC swing, NOT
-            # measured. User assumes +-4mm excursion; a direct mm->volt
+            max_vrms: 1768.0;
+            # 2026-11-22: was max_vrms 2500.0 (2026-08-27). max_vrms is
+            # the RMS of a sine at the limit; the peak ceiling is
+            # sqrt(2) x max_vrms (CALCULATED from the source). So 2500.0
+            # meant ~3536 V peak, not the intended ~2500 V. 1768.0 =
+            # ~2500 V peak at the stator, the same value as the live
+            # config (READ, live config 2026-11-21).
+            # The 2500 V peak ceiling itself is an ASSUMPTION (no maker
+            # data; OPEN question to the system owner, 2026-11-21).
+            # Original note: panel's own hard safety ceiling -- bias
+            # voltage (~2.5kV) as a practical ceiling for the stator AC
+            # swing, NOT measured. User assumes +-4mm excursion; a direct mm->volt
             # derivation would need the panel's gap dimension/diaphragm
             # stiffness, which aren't known -- precise later via
             # measurement. Deliberately NOT frequency-weighted, unlike

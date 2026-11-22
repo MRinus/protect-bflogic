@@ -546,8 +546,9 @@ for the config syntax and the modelling method. Do not copy its numbers.
     ASSUMPTION: there is no maker data (OPEN question to the system
     owner, 2026-11-21). The live config uses `max_vrms: 1768`, which is
     about 2500 V peak (READ, see [Units](#units-what-max_vrms-means)).
-    The example file still has `max_vrms: 2500` from 2026-08-27, which
-    is about 3536 V peak (CALCULATED).
+    The example file uses the same value since 2026-11-22. Before, it had
+    `max_vrms: 2500` (2026-08-27), which is about 3536 V peak
+    (CALCULATED).
 
 ## License
 
