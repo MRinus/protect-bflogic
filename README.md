@@ -56,6 +56,47 @@ threshold you calculated by hand.
   — other checkpoints in the same group are unaffected. Currently
   supports 1 or 2 stages (6 or 12 dB/octave); more would be a trivial
   cascade extension but hasn't been needed yet.
+- A peak limit can use **`weighting: "integrator";`** for transformer core
+  flux. Core flux is the integral of the voltage, so the voltage a core
+  can take falls by 6 dB/octave towards low frequencies. The detector is
+  a leaky integrator on the signed signal (a one-pole low-pass at
+  `hp_corner_hz`, a few Hz; this is the high-pass corner that stops DC
+  drift), then `|.|`. It is normalised to gain 1 at `ref_freq_hz`, so
+  `max_vrms` is the ceiling **at `ref_freq_hz`**:
+
+  ```
+  limit: { name: "stepup_flux"; max_vrms: 971.0; type: "peak";
+           weighting: "integrator"; ref_freq_hz: 80.0; hp_corner_hz: 2.0;
+           attack_ms: 0.5; release_ms: 3000.0; };
+  # startup log: ceiling 971.0 V @ 80.0 Hz, 486.0 V @ 40 Hz,
+  #              243.9 V @ 20 Hz, 123.7 V @ 10 Hz
+  ```
+
+  Rules: `ref_freq_hz` and `hp_corner_hz` are required, `hp_corner_hz <=
+  ref_freq_hz/4`, and `slope_db_oct` must be omitted or 6.
+  Above `ref_freq_hz` the ceiling rises 6 dB/octave. The ceiling is
+  never above that of the 1-pole `ref_freq_hz`/6 dB weighting, at any
+  frequency (test I6).
+
+  The smooth attack/release gain alone does **not** bound the output
+  flux. It acts on the voltage, while the flux integrates over the past.
+  Measured: a 20 Hz burst with a hard onset reached 2.8× the flux
+  ceiling. Therefore an exact **flux backstop** runs on the final output
+  of the channel, after all limits, the link and the lookahead. It
+  tracks the output flux and reduces any sample that would push the
+  flux over the ceiling, so the output flux never exceeds the ceiling
+  (tests I3, I5). It acts per sample, so it distorts. Keep it rare with
+  a long `release_ms`, which keeps the smooth gain steady across the
+  flux peaks. Measured with a 20 Hz tone at 971 V (steady state, 1 ms
+  lookahead):
+
+  | `release_ms` | THD+N while limiting | fundamental at the output |
+  |---|---|---|
+  | 300 | 9.7 % | 249.7 V |
+  | 1000 | 4.1 % | 246.0 V |
+  | 3000 | 1.8 % | 244.6 V |
+
+  All three hold the flux exactly at the ceiling.
 - A limit can reference just the **first N stages of its chain**
   (`stage: N;`, 1-indexed) instead of the full chain — needed when
   several limits in the same group sit at different points along the

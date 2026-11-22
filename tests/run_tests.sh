@@ -84,6 +84,9 @@ echo; echo "== tests =="
 OUT="$out" ROOT="$root" HERE="$here" bash "$here/tests.sh"
 rc=$?
 [ $rc -ne 0 ] && fail=1
+
+echo; echo "== tests: weighting \"integrator\" (Cue-020) =="
+OUT="$out" ROOT="$root" INC="$INC" bash "$here/integ/integ_tests.sh" || fail=1
 echo
 [ $fail -eq 0 ] && echo "[run_tests] RESULT: ALL PASS" || echo "[run_tests] RESULT: FAILURES"
 exit $fail

@@ -26,6 +26,19 @@
  * two groups or two links, ratio/offset out of range, ...) make preinit
  * return -1 -> BruteFIR exits with BF_EXIT_INVALID_CONFIG (fail-safe).
  *
+ * WEIGHTING "integrator" (dev-2, 2026-11-22, Cue-020):
+ *
+ *   limit: { ...; type: "peak"; weighting: "integrator";
+ *            ref_freq_hz: 80.0; hp_corner_hz: 2.0; ... };
+ *
+ * Transformer core flux: leaky integrator on the signed signal (one-pole
+ * low-pass at hp_corner_hz), |.|, normalised to gain 1 at ref_freq_hz, so
+ * max_vrms is the ceiling AT ref_freq_hz and it falls 6 dB/octave below.
+ * Stage 1 is the usual smooth attack/release gain on this detector.
+ * Stage 2, flux_backstop(), bounds the flux of the FINAL output exactly.
+ * Configs without this weighting run the unchanged code (tests T1b, LA
+ * hashes). Tests: tests/integ/integ_tests.sh (I0-I7).
+ *
  * Ersetzt die fest vorgerechneten dBFS-Schwellen aus v1 durch eine
  * deklarative Beschreibung der realen Signalkette. Nichts wird mehr
  * von Hand in dBFS umgerechnet -- das Modul tut das selbst, aus:
@@ -138,6 +151,17 @@ struct limit_cfg {
     /* v3: Gewichtung VOR dem Betrag (1) statt dahinter (0, Altverhalten).
        Nur mit freq_weighted wirksam. Siehe Kommentar in process_channel(). */
     int    signed_weight;
+    /* weighting "integrator" (Cue-020): leaky integrator on the signed
+       signal (one-pole low-pass at hp_corner_hz, i.e. an integrator with a
+       high-pass corner), then |.|, scaled by integ_gain so that the
+       detector gain is exactly 1 at ref_freq_hz. max_vrms is then the
+       ceiling AT ref_freq_hz; below it the ceiling falls 6 dB/octave
+       (transformer core flux ~ integral of the voltage). Uses shelf_coeff
+       and shelf_z1; signed_weight stays 0. */
+    int    integrator;
+    double integ_gain;
+    double integ_ref_hz;
+    double integ_hp_hz;
     /* v3: zur Laufzeit per "lmc <idx> on|off <name>" schaltbar. 0 = der
        Checkpoint wird uebersprungen (Gain 1.0). always_on = 1 verbietet
        das Ausschalten (Verstaerker-Clip, Thermik). */
@@ -162,6 +186,11 @@ struct limit_state {
     double shelf_z1;      /* Filterzustand Kaskadenstufe 1, nur wenn freq_weighted */
     double shelf_z2;      /* Filterzustand Kaskadenstufe 2, nur wenn shelf_poles==2 */
     long   overs;
+    /* integrator only (Cue-020): flux of the FINAL output (after all
+       limits, link and lookahead) and the number of samples the exact
+       flux backstop had to reduce, see flux_backstop(). */
+    double flux_out;
+    long   flux_clips;
 };
 
 struct channel_runtime {
@@ -382,6 +411,7 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
     double attack_ms = 1.0, release_ms = 200.0;
     double window_ms = 500.0, rms_release_ms = 2000.0;
     double ref_freq_hz = 0.0, slope_db_oct = 0.0;
+    double hp_corner_hz = 0.0;
     int stage = 0;
     char type_str[32] = "peak";
     char weighting_str[16] = "abs";
@@ -415,6 +445,10 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
             GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
             slope_db_oct = lexval.real;
             GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
+        } else if (strcmp(lexval.field, "hp_corner_hz") == 0) {
+            GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
+            hp_corner_hz = lexval.real;
+            GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
         } else if (strcmp(lexval.field, "attack_ms") == 0) {
             GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
             attack_ms = lexval.real;
@@ -438,7 +472,9 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
         } else if (strcmp(lexval.field, "weighting") == 0) {
             /* "abs"    = Altverhalten: erst Betrag, dann Tiefpaesse
                "signed" = erst Tiefpaesse auf das vorzeichenbehaftete
-                          Signal, dann Betrag (v3, physikalisch korrekt) */
+                          Signal, dann Betrag (v3, physikalisch korrekt)
+               "integrator" = leaky integrator, normalised at ref_freq_hz
+                          (needs ref_freq_hz + hp_corner_hz, Cue-020) */
             GET_TOKEN(BF_LEXVAL_STRING, "expected string.\n");
             strncpy(weighting_str, lexval.string, sizeof(weighting_str) - 1);
             GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
@@ -467,13 +503,16 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
         return -1;
     }
     if (strcmp(weighting_str, "abs") != 0 &&
-        strcmp(weighting_str, "signed") != 0)
+        strcmp(weighting_str, "signed") != 0 &&
+        strcmp(weighting_str, "integrator") != 0)
     {
-        fprintf(stderr, "PROTECT: limit '%s': weighting must be \"abs\" or "
-                "\"signed\", got '%s'.\n", l->name, weighting_str);
+        fprintf(stderr, "PROTECT: limit '%s': weighting must be \"abs\", "
+                "\"signed\" or \"integrator\", got '%s'.\n", l->name,
+                weighting_str);
         return -1;
     }
     l->signed_weight = (strcmp(weighting_str, "signed") == 0);
+    l->integrator = (strcmp(weighting_str, "integrator") == 0);
     l->enabled = enabled;
     l->always_on = always_on;
     if (always_on && !enabled) {
@@ -495,7 +534,49 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
         l->release_coeff =
             exp(-1.0 / (sample_rate * (rms_release_ms / 1000.0)));
     }
-    if (ref_freq_hz > 0.0 && slope_db_oct != 0.0) {
+    if (l->integrator) {
+        /* Cue-020: leaky integrator, see struct limit_cfg. */
+        if (ref_freq_hz <= 0.0 || hp_corner_hz <= 0.0) {
+            fprintf(stderr, "PROTECT: limit '%s': weighting \"integrator\" "
+                    "needs ref_freq_hz and hp_corner_hz.\n", l->name);
+            return -1;
+        }
+        if (slope_db_oct != 0.0 && fabs(slope_db_oct - 6.0) > 0.01) {
+            fprintf(stderr, "PROTECT: limit '%s': weighting \"integrator\" "
+                    "is 6 dB/octave by definition; slope_db_oct %.2f is not "
+                    "allowed (omit it or give 6).\n", l->name, slope_db_oct);
+            return -1;
+        }
+        if (hp_corner_hz > ref_freq_hz / 4.0) {
+            fprintf(stderr, "PROTECT: limit '%s': hp_corner_hz %.3f must be "
+                    "<= ref_freq_hz/4 (%.3f), else the detector is no "
+                    "integrator at ref_freq_hz.\n", l->name, hp_corner_hz,
+                    ref_freq_hz / 4.0);
+            return -1;
+        }
+        if (ref_freq_hz >= sample_rate / 4.0) {
+            fprintf(stderr, "PROTECT: limit '%s': ref_freq_hz %.1f must be "
+                    "below sample_rate/4.\n", l->name, ref_freq_hz);
+            return -1;
+        }
+        l->freq_weighted = 1;
+        l->shelf_poles = 1;
+        l->shelf_coeff = exp(-2.0 * M_PI * hp_corner_hz / sample_rate);
+        {
+            /* exact gain of the discrete filter (1-a)/(1 - a z^-1) at
+               ref_freq_hz; integ_gain = 1/|H| makes the detector gain 1
+               there. */
+            double a = l->shelf_coeff;
+            double w = 2.0 * M_PI * ref_freq_hz / sample_rate;
+            l->integ_gain = sqrt(1.0 - 2.0 * a * cos(w) + a * a) / (1.0 - a);
+        }
+        l->integ_ref_hz = ref_freq_hz;
+        l->integ_hp_hz = hp_corner_hz;
+    } else if (hp_corner_hz != 0.0) {
+        fprintf(stderr, "PROTECT: limit '%s': hp_corner_hz is only valid "
+                "with weighting \"integrator\".\n", l->name);
+        return -1;
+    } else if (ref_freq_hz > 0.0 && slope_db_oct != 0.0) {
         int poles = (int)(slope_db_oct / 6.0 + 0.5);
         if (poles < 1 || poles > MAX_SHELF_POLES ||
             fabs(slope_db_oct - poles * 6.0) > 0.01)
@@ -637,6 +718,23 @@ parse_group(int (*get_config_token)(union bflexval *lexval),
                     lc->stage > 0 ? " (partielle Chain)" : "",
                     max_vrms_raw, 20.0 * log10(lc->threshold_lin),
                     lc->freq_weighted ? " (frequenzgewichtet)" : "");
+            if (lc->integrator) {
+                /* ceiling(f) = max_vrms / (integ_gain * |H(f)|) */
+                static const double fs_log[4] = { 10.0, 20.0, 40.0, 0.0 };
+                double a = lc->shelf_coeff, ceil_v[4];
+                for (int k = 0; k < 4; k++) {
+                    double f = fs_log[k] > 0.0 ? fs_log[k] : lc->integ_ref_hz;
+                    double w = 2.0 * M_PI * f / sample_rate;
+                    double h = (1.0 - a) / sqrt(1.0 - 2.0 * a * cos(w) + a * a);
+                    ceil_v[k] = max_vrms_raw / (lc->integ_gain * h);
+                }
+                fprintf(stderr, "PROTECT:   limit='%s' integrator: hp corner "
+                        "%.2f Hz, normalised at %.1f Hz; ceiling %.1f V @ "
+                        "%.1f Hz, %.1f V @ 40 Hz, %.1f V @ 20 Hz, %.1f V @ "
+                        "10 Hz\n", lc->name, lc->integ_hp_hz, lc->integ_ref_hz,
+                        ceil_v[3], lc->integ_ref_hz, ceil_v[2], ceil_v[1],
+                        ceil_v[0]);
+            }
         }
     }
     return 0;
@@ -905,6 +1003,70 @@ resolve_links(const int n_channels[2], const struct bfchannel *channels[2])
 
 /* ---- Kern: Sample-Verarbeitung ----------------------------------------- */
 
+/* Cue-020, weighting "integrator", stage 1 (smooth gain): leaky integrator
+   on the signed INPUT sample, normalised to gain 1 at ref_freq_hz. A
+   non-finite state (NaN/Inf input) is reset to 0 so that it cannot
+   disable the detector for good. */
+static inline double
+integ_detect(struct limit_cfg *lc, struct limit_state *ls, double s)
+{
+    ls->shelf_z1 = (1.0 - lc->shelf_coeff) * s + lc->shelf_coeff * ls->shelf_z1;
+    if (!isfinite(ls->shelf_z1)) ls->shelf_z1 = 0.0;
+    return lc->integ_gain * fabs(ls->shelf_z1);
+}
+
+/* Cue-020, weighting "integrator", stage 2 (exact backstop), on the FINAL
+   output samples of one channel (after all limits, link and lookahead).
+   Stage 1 alone does not bound the output flux: its gain acts on the
+   voltage while the flux integrates over the past, so on a hard onset
+   the output flux overshoots (measured: 2.8x the ceiling for a 20 Hz
+   burst that starts at zero phase). Here, per sample and per enabled
+   integrator limit, with P = flux_out[n-1] and c = shelf_coeff:
+     q = c*P + (1-c)*y;  if |q| > F (F = threshold_lin/integ_gain)
+         y := (sign(q)*F - c*P) / (1-c)
+   Induction: |P| <= F, so |c*P| < F, so the new y has the sign of the
+   old y and a smaller magnitude (a gain in [0,1)), and |flux_out| <= F
+   holds after every sample. Several integrator limits: each one only
+   shrinks y towards 0; the bound of an earlier one stays true (it holds
+   at y = 0 and at its own y, so on the whole interval between). All
+   states are updated with the final y, also of limits switched off by
+   "lmc ... off", so the flux is right when the limit is switched on
+   again. Hot path: no calls, no allocation. */
+static inline void
+flux_backstop(struct group *g, struct channel_runtime *rt, double *samples,
+              int n)
+{
+    int any = 0;
+    for (int l = 0; l < g->n_limits; l++) {
+        if (g->limits[l].integrator) { any = 1; break; }
+    }
+    if (!any) return;
+    for (int i = 0; i < n; i++) {
+        double y = samples[i];
+        if (!isfinite(y)) continue;          /* existing behaviour for NaN/Inf */
+        for (int l = 0; l < g->n_limits; l++) {
+            struct limit_cfg *lc = &g->limits[l];
+            if (!lc->integrator || !lc->enabled) continue;
+            struct limit_state *ls = &rt->st[l];
+            double c = lc->shelf_coeff, F = lc->threshold_lin / lc->integ_gain;
+            double p = c * ls->flux_out;
+            double q = p + (1.0 - c) * y;
+            if (fabs(q) > F) {
+                y = (copysign(F, q) - p) / (1.0 - c);
+                ls->flux_clips++;
+            }
+        }
+        samples[i] = y;
+        for (int l = 0; l < g->n_limits; l++) {
+            struct limit_cfg *lc = &g->limits[l];
+            if (!lc->integrator) continue;   /* also while off: state stays real */
+            struct limit_state *ls = &rt->st[l];
+            ls->flux_out = lc->shelf_coeff * ls->flux_out +
+                           (1.0 - lc->shelf_coeff) * y;
+        }
+    }
+}
+
 /* Detector + checkpoint smoothing for ONE sample: unchanged v3 code, only
    moved out of process_channel() so that the plain path and the link path
    share exactly the same detector (design 3.2: the invariant rests on the
@@ -929,7 +1091,9 @@ detect_sample(struct group *g, struct channel_runtime *rt, double s)
                 continue;
             }
 
-            if (lc->freq_weighted && lc->signed_weight) {
+            if (lc->integrator) {
+                detect_mag = integ_detect(lc, ls, s);
+            } else if (lc->freq_weighted && lc->signed_weight) {
                 /* v3: Tiefpass-Kaskade auf das VORZEICHENBEHAFTETE Signal,
                    danach Betrag. Das ist die Uebertragungsfunktion
                    Spannung -> Membranauslenkung einer geschlossenen Box
@@ -1006,6 +1170,7 @@ weighted_mag(struct limit_cfg *lc, struct limit_state *ls, double s)
 {
     double d;
     if (!lc->freq_weighted) return fabs(s);
+    if (lc->integrator) return integ_detect(lc, ls, s);
     if (lc->signed_weight) {
         ls->shelf_z1 = (1.0 - lc->shelf_coeff) * s + lc->shelf_coeff * ls->shelf_z1;
         d = ls->shelf_z1;
@@ -1277,6 +1442,10 @@ output_timed(void *buf, int channel)
         a_store_d(&w->gmin, own_min);
         a_store_l(&w->blk, k);
     }
+
+    /* Cue-020: exact flux bound on the final output (returns at once when
+       the group has no enabled integrator limit). */
+    flux_backstop(&groups[gi], &ch_runtime[gi][ci], samples, n);
 
     if (fbuf != NULL) {
         for (int i = 0; i < n; i++) fbuf[i] = (float)tmp[i];
@@ -1713,7 +1882,8 @@ bflogic_command(const char params[])
                     lc->name, lc->enabled ? "ON" : "off",
                     lc->type == LIMIT_RMS ? "rms" : "peak",
                     !lc->freq_weighted ? "-" :
-                        (lc->signed_weight ? "signed" : "abs"),
+                        (lc->integrator ? "integ" :
+                         (lc->signed_weight ? "signed" : "abs")),
                     20.0 * log10(lc->threshold_lin / output_scale),
                     lc->always_on ? "  (always_on)" : "");
             }
