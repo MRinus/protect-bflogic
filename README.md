@@ -76,8 +76,21 @@ threshold you calculated by hand.
   required, with `0.1 <= hp_corner_hz <= ref_freq_hz/4`. `slope_db_oct`
   must be omitted or 6.
   Above `ref_freq_hz` the ceiling rises 6 dB/octave. The ceiling is
-  never above that of the 1-pole `ref_freq_hz`/6 dB weighting, at any
-  frequency (test I6).
+  never above that of the 1-pole `ref_freq_hz`/6 dB weighting with
+  `weighting: "signed"`, at any frequency (test I6).
+
+  **Add it next to an existing transformer limit; never replace that
+  limit "because the integrator covers it".** It does not:
+  - The real core does not follow the 1/f model exactly. In the example
+    deployment the measured 2 % THD point at 130 Hz is 1503 V, but the
+    integrator (971 V @ 80 Hz) allows 1578 V there (+0.4 dB).
+  - The default `"abs"` 1-pole weighting (no `weighting` field, as in the
+    example config) is stricter than the integrator above about 100 Hz.
+    Offline measurement, fundamental at the limit: 1286 V against
+    1583 V at 130 Hz, and 1412 V against 3888 V at 320 Hz.
+
+  The strictest limit wins per sample, so adding the integrator never
+  weakens anything.
 
   The smooth attack/release gain alone does **not** bound the output
   flux. It acts on the voltage, while the flux integrates over the past.
