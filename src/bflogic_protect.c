@@ -26,60 +26,70 @@
  * two groups or two links, ratio/offset out of range, ...) make preinit
  * return -1 -> BruteFIR exits with BF_EXIT_INVALID_CONFIG (fail-safe).
  *
- * Ersetzt die fest vorgerechneten dBFS-Schwellen aus v1 durch eine
- * deklarative Beschreibung der realen Signalkette. Nichts wird mehr
- * von Hand in dBFS umgerechnet -- das Modul tut das selbst, aus:
+ * WEIGHTING "integrator" (dev-2, 2026-11-22, Cue-020):
+ *
+ *   limit: { ...; type: "peak"; weighting: "integrator";
+ *            ref_freq_hz: 80.0; hp_corner_hz: 2.0; ... };
+ *
+ * Transformer core flux: leaky integrator on the signed signal (one-pole
+ * low-pass at hp_corner_hz), |.|, normalised to gain 1 at ref_freq_hz, so
+ * max_vrms is the ceiling AT ref_freq_hz and it falls 6 dB/octave below.
+ * Stage 1 is the usual smooth attack/release gain on this detector.
+ * Stage 2, flux_backstop(), bounds the flux of the FINAL output exactly.
+ * Configs without this weighting run the unchanged code (tests T1b, LA
+ * hashes). Tests: tests/integ/integ_tests.sh (I0-I7).
+ *
+ * v3 replaces the fixed, precalculated dBFS thresholds of v1 with a
+ * declarative description of the real signal chain. Nobody converts to
+ * dBFS by hand any more: the module does it, from:
  *
  *   chain  <name> { dac_max_output_vrms: ...; stage { gain_db: ...; }; ... }
  *   group  { channels: ...; chain: "<name>";
  *            limit { name: ...; max_vrms: ...; type: "peak"|"rms";
  *                    [ref_freq_hz: ...; slope_db_oct: ...;]
  *                    attack_ms/release_ms/window_ms/rms_release_ms: ...; };
- *            ... beliebig viele limit-Bloecke ...
+ *            ... any number of limit blocks ...
  *          };
  *
- * KONZEPT
+ * CONCEPT
  * -------
- * Eine "chain" beschreibt den Signalweg vom DAC-Vollausschlag (0dBFS)
- * bis zu einem beliebigen Punkt in der Kette: DAC-Referenzspannung
- * mal Produkt aller stage-gains (in dB, koennen negativ sein fuer
- * Verluste/Adapter, positiv fuer Verstaerker-Gain).
+ * A "chain" describes the signal path from the DAC full scale (0 dBFS)
+ * to any point in the chain: the DAC reference voltage times the product
+ * of all stage gains (in dB; negative for losses/adapters, positive for
+ * amplifier gain).
  *
- * Eine "group" haengt sich an genau eine chain und definiert
- * beliebig viele "limit"-Checkpoints. Jeder Checkpoint hat eine
- * physikalische Grenzspannung (max_vrms) an SEINEM Punkt in der
- * Kette -- das Modul rechnet daraus selbst die noetige normierte
- * (0dBFS=1.0) Schwelle: threshold_lin = max_vrms / (dac_max_output_vrms
- * * chain_gain_lin). Kein Handrechnen mehr noetig, auch nicht bei
- * Aenderung von Kabeln/Adaptern/Amps -- nur die chain-Parameter
- * anpassen.
+ * A "group" refers to exactly one chain and defines any number of
+ * "limit" checkpoints. Each checkpoint has a physical voltage ceiling
+ * (max_vrms) at ITS point in the chain. The module calculates the
+ * normalised threshold (0 dBFS = 1.0) from it: threshold_lin = max_vrms /
+ * (dac_max_output_vrms * chain_gain_lin). Nobody calculates by hand, also
+ * not when a cable, adapter or amplifier changes: change only the chain
+ * parameters.
  *
- * Jeder Checkpoint kann optional frequenzgewichtet sein
- * (ref_freq_hz + slope_db_oct): fuer physikalisch frequenzabhaengige
- * Grenzen wie Trafo-Kernsaettigung (Grenzspannung steigt ~6dB/Oktave
- * mit der Frequenz, 1-polig) oder Woofer-Xmax in einer geschlossenen
- * Box (Grenzspannung steigt ~12dB/Oktave oberhalb der Boxreso, 2-polig).
- * Umgesetzt als Kaskade von Einpol-Tiefpaessen (gleiche Eckfrequenz
- * ref_freq_hz, N = slope_db_oct/6 Stufen hintereinander) auf den
- * Detektor-Eingang dieses einen Checkpoints -- andere Checkpoints in
- * derselben Gruppe bleiben davon unberuehrt. Unterstuetzt aktuell 1
- * oder 2 Stufen (6 oder 12 dB/Oktave); mehr waere per Kaskadierung
- * trivial erweiterbar, aber bisher nicht gebraucht.
+ * A checkpoint can be frequency-weighted (ref_freq_hz + slope_db_oct), for
+ * limits that change with the frequency: transformer core saturation (the
+ * ceiling rises ~6 dB/octave with the frequency, 1 pole) or woofer Xmax
+ * in a sealed box (the ceiling rises ~12 dB/octave above the box
+ * resonance, 2 poles). Implemented as a cascade of one-pole low-passes
+ * (same corner frequency ref_freq_hz, N = slope_db_oct/6 stages) on the
+ * detector input of this one checkpoint. Other checkpoints in the same
+ * group do not change. 1 or 2 stages (6 or 12 dB/octave) are supported;
+ * more stages would be a simple extension of the cascade, but no limit
+ * has needed them.
  *
- * Ein Limit kann mit "stage: N;" (1-indiziert) sagen, dass es nur an
- * den ersten N Stufen der Chain gemessen ist, nicht an der vollen
- * Chain -- noetig, wenn mehrere Limits derselben Gruppe an
- * unterschiedlichen Punkten derselben Kaskade sitzen (z.B. Trafo-
- * Saettigung vor einer Endstufe, Amp-Rated-Power dahinter). Fehlt
- * "stage", gilt die komplette Chain -- das Feld ueberschreibt die
- * Referenz, es addiert sich NICHT zur Chain-Gesamtverstaerkung dazu.
+ * With "stage: N;" (counted from 1) a limit says that it is measured after
+ * the first N stages of the chain, not after the full chain. This is
+ * necessary when several limits of one group sit at different points of
+ * the same cascade (for example transformer saturation before a power
+ * amplifier, the rated power of the amplifier after it). Without "stage"
+ * the full chain applies. The field REPLACES the reference point; it does
+ * NOT add to the total chain gain.
  *
- * Alle Checkpoints (peak wie rms, ueber alle limits einer Gruppe)
- * laufen parallel; die tatsaechlich angewandte Verstaerkung ist das
- * Minimum aller Einzel-Gains -- der jeweils strengste Checkpoint
- * gewinnt automatisch, ganz ohne Prioritaeten von Hand festzulegen.
+ * All checkpoints (peak and rms, over all limits of a group) run in
+ * parallel. The applied gain is the minimum of all single gains, so the
+ * strictest checkpoint always wins, without a priority order set by hand.
  *
- * Kompilieren:
+ * Build:
  *   gcc -O2 -fPIC -shared -DIS_BFLOGIC_MODULE \
  *       -I<brutefir-source-dir> -o protect.bflogic bflogic_protect.c -lm
  */
@@ -104,42 +114,55 @@
 #define MAX_GROUPS 8
 #define MAX_CH_PER_GROUP 4
 #define MAX_LIMITS_PER_GROUP 8
+#define MAX_MAPPED_CHANNELS_LA 64   /* == MAX_MAPPED_CHANNELS, defined before use */
 
 #define LIMIT_PEAK 0
 #define LIMIT_RMS  1
 
-/* ---- statische Konfiguration ------------------------------------------ */
+/* ---- static configuration ---------------------------------------------- */
 
 struct chain {
     char   name[BF_MAXOBJECTNAME];
     double dac_max_output_vrms;
-    double gain_lin;              /* Produkt ALLER stage-gains, linear */
-    double stage_gain_db[MAX_STAGES_PER_CHAIN];  /* einzelne Stufen, der Reihe nach */
+    double gain_lin;              /* product of ALL stage gains, linear */
+    double stage_gain_db[MAX_STAGES_PER_CHAIN];  /* single stages, in order */
     int    n_stages;
 };
 
-#define MAX_SHELF_POLES 2   /* 6 oder 12 dB/Oktave; siehe Kommentar oben */
+#define MAX_SHELF_POLES 2   /* 6 or 12 dB/octave; see the comment at the top */
 
 struct limit_cfg {
     char   name[BF_MAXOBJECTNAME];
-    int    type;                  /* LIMIT_PEAK oder LIMIT_RMS */
-    double threshold_lin;         /* aus max_vrms + chain berechnet */
+    int    type;                  /* LIMIT_PEAK or LIMIT_RMS */
+    double threshold_lin;         /* calculated from max_vrms + chain */
     double attack_coeff;
     double release_coeff;
-    double window_samples;        /* nur RMS */
-    /* Frequenzgewichtung (optional, nur PEAK sinnvoll) */
+    double window_samples;        /* RMS only */
+    /* frequency weighting (optional, useful for PEAK only) */
     int    freq_weighted;
-    double shelf_coeff;           /* Einpol-Tiefpass-Koeffizient, pro Kaskadenstufe gleich */
-    int    shelf_poles;           /* 1 oder 2 kaskadierte Stufen -> 6 oder 12 dB/Oktave */
-    /* 0 = volle Chain-Verstaerkung; sonst: nur die ersten `stage`
-       Stufen der Chain summieren (1-indiziert), s.o. */
+    double shelf_coeff;           /* one-pole low-pass coefficient, same for each cascade stage */
+    int    shelf_poles;           /* 1 or 2 cascaded stages -> 6 or 12 dB/octave */
+    /* 0 = full chain gain; otherwise: sum only the first `stage`
+       stages of the chain (counted from 1), see above. */
     int    stage;
-    /* v3: Gewichtung VOR dem Betrag (1) statt dahinter (0, Altverhalten).
-       Nur mit freq_weighted wirksam. Siehe Kommentar in process_channel(). */
+    /* v3: weighting BEFORE the magnitude (1) instead of after it (0, old
+       behaviour). Acts only with freq_weighted. See the comment in
+       process_channel(). */
     int    signed_weight;
-    /* v3: zur Laufzeit per "lmc <idx> on|off <name>" schaltbar. 0 = der
-       Checkpoint wird uebersprungen (Gain 1.0). always_on = 1 verbietet
-       das Ausschalten (Verstaerker-Clip, Thermik). */
+    /* weighting "integrator" (Cue-020): leaky integrator on the signed
+       signal (one-pole low-pass at hp_corner_hz, i.e. an integrator with a
+       high-pass corner), then |.|, scaled by integ_gain so that the
+       detector gain is exactly 1 at ref_freq_hz. max_vrms is then the
+       ceiling AT ref_freq_hz; below it the ceiling falls 6 dB/octave
+       (transformer core flux ~ integral of the voltage). Uses shelf_coeff
+       and shelf_z1; signed_weight stays 0. */
+    int    integrator;
+    double integ_gain;
+    double integ_ref_hz;
+    double integ_hp_hz;
+    /* v3: switchable at runtime with "lmc <idx> on|off <name>". 0 = the
+       checkpoint is skipped (gain 1.0). always_on = 1 forbids switching
+       it off (amplifier clipping, thermal). */
     volatile int enabled;
     int    always_on;
 };
@@ -153,14 +176,19 @@ struct group {
     struct limit_cfg limits[MAX_LIMITS_PER_GROUP];
 };
 
-/* ---- Laufzeit-Zustand pro Kanal und Checkpoint ------------------------- */
+/* ---- runtime state per channel and checkpoint -------------------------- */
 
 struct limit_state {
-    double gain;        /* geglaettete aktuelle Verstaerkung dieses Checkpoints */
-    double rms_sumsq;    /* nur RMS-Typ */
-    double shelf_z1;      /* Filterzustand Kaskadenstufe 1, nur wenn freq_weighted */
-    double shelf_z2;      /* Filterzustand Kaskadenstufe 2, nur wenn shelf_poles==2 */
+    double gain;        /* smoothed current gain of this checkpoint */
+    double rms_sumsq;    /* RMS type only */
+    double shelf_z1;      /* filter state of cascade stage 1, only if freq_weighted */
+    double shelf_z2;      /* filter state of cascade stage 2, only if shelf_poles==2 */
     long   overs;
+    /* integrator only (Cue-020): flux of the FINAL output (after all
+       limits, link and lookahead) and the number of samples the exact
+       flux backstop had to reduce, see flux_backstop(). */
+    double flux_out;
+    long   flux_clips;
 };
 
 struct channel_runtime {
@@ -194,6 +222,41 @@ static struct channel_runtime ch_runtime[MAX_GROUPS][MAX_CH_PER_GROUP];
    isn't silently wrong if a config ever uses a different sample
    format. */
 static double output_scale = 2147483647.0;
+
+/* ---- Lookahead (stage 2a, 2026-11-17) ------------------------------------
+   Optional top-level "lookahead_ms: <real>;" (default 0 = off, the v3/link
+   path is then byte-identical). With L = D+1, D = round(lookahead_ms*fs):
+   - EVERY output channel the module sees is delayed by D samples (mapped
+     or not), so the time alignment between all outputs is kept;
+   - each PEAK limit computes its instantaneous required gain
+     r[n] = thr/|detect[n]| (1 if below), takes the sliding minimum over the
+     last L samples and box-averages that minimum over L samples. Every
+     average at time n only contains minima whose window includes sample
+     n-D, so avg[n] <= r[n-D]: the gain applied to the delayed sample is
+     never above what that sample needs (no overshoot, sample-exact for
+     unweighted limits), and it ramps down linearly over D samples ahead of
+     the peak instead of reacting after it. A release smoother can only
+     slow increases; a final min(g, r[n-D]) absorbs rounding.
+   - attack_ms is not used by peak limits in this mode (the ramp is D).
+   - weighted limits (ref_freq_hz/slope) run the same scheme on their
+     weighted detector; because the gain acts before the weighting filter
+     in reality, the bound there is close but not exact (offline test).
+   - RMS limits keep their v3 smoothing; their gain is applied to the
+     delayed sample (D is far below their time constants). */
+#define LA_MAX_MS 10.0
+static double lookahead_ms = 0.0;
+static int    la_L = 0;                    /* 0 = lookahead off */
+struct la_state {                          /* one per [group][ch][limit] */
+    double *rring;                         /* r[], L */
+    double *mring;                         /* window minima, L */
+    double *dq_val;                        /* monotonic deque, L */
+    long   *dq_idx;
+    int     dq_head, dq_cnt;
+    double  sum;                           /* sum of mring */
+};
+static struct la_state *la_st;             /* [MAX_GROUPS][MAX_CH][MAX_LIM] */
+static double *la_dly[MAX_MAPPED_CHANNELS_LA];  /* audio delay ring, L */
+static long    la_n[MAX_MAPPED_CHANNELS_LA];    /* samples seen per channel */
 
 static int sample_rate;
 static int block_length;
@@ -346,6 +409,7 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
     double attack_ms = 1.0, release_ms = 200.0;
     double window_ms = 500.0, rms_release_ms = 2000.0;
     double ref_freq_hz = 0.0, slope_db_oct = 0.0;
+    double hp_corner_hz = 0.0;
     int stage = 0;
     char type_str[32] = "peak";
     char weighting_str[16] = "abs";
@@ -379,6 +443,10 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
             GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
             slope_db_oct = lexval.real;
             GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
+        } else if (strcmp(lexval.field, "hp_corner_hz") == 0) {
+            GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
+            hp_corner_hz = lexval.real;
+            GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
         } else if (strcmp(lexval.field, "attack_ms") == 0) {
             GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
             attack_ms = lexval.real;
@@ -400,9 +468,11 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
             stage = (int)(lexval.real + 0.5);
             GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
         } else if (strcmp(lexval.field, "weighting") == 0) {
-            /* "abs"    = Altverhalten: erst Betrag, dann Tiefpaesse
-               "signed" = erst Tiefpaesse auf das vorzeichenbehaftete
-                          Signal, dann Betrag (v3, physikalisch korrekt) */
+            /* "abs"    = old behaviour: magnitude first, then low-passes
+               "signed" = low-passes on the signed signal first, then
+                          the magnitude (v3, physically correct)
+               "integrator" = leaky integrator, normalised at ref_freq_hz
+                          (needs ref_freq_hz + hp_corner_hz, Cue-020) */
             GET_TOKEN(BF_LEXVAL_STRING, "expected string.\n");
             strncpy(weighting_str, lexval.string, sizeof(weighting_str) - 1);
             GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
@@ -431,13 +501,16 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
         return -1;
     }
     if (strcmp(weighting_str, "abs") != 0 &&
-        strcmp(weighting_str, "signed") != 0)
+        strcmp(weighting_str, "signed") != 0 &&
+        strcmp(weighting_str, "integrator") != 0)
     {
-        fprintf(stderr, "PROTECT: limit '%s': weighting must be \"abs\" or "
-                "\"signed\", got '%s'.\n", l->name, weighting_str);
+        fprintf(stderr, "PROTECT: limit '%s': weighting must be \"abs\", "
+                "\"signed\" or \"integrator\", got '%s'.\n", l->name,
+                weighting_str);
         return -1;
     }
     l->signed_weight = (strcmp(weighting_str, "signed") == 0);
+    l->integrator = (strcmp(weighting_str, "integrator") == 0);
     l->enabled = enabled;
     l->always_on = always_on;
     if (always_on && !enabled) {
@@ -447,19 +520,72 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
     }
     l->stage = stage;
     l->type = (strcmp(type_str, "rms") == 0) ? LIMIT_RMS : LIMIT_PEAK;
-    /* threshold_lin wird erst spaeter (nach Aufloesung der chain)
-       final gesetzt -- hier zwischenspeichern in max_vrms-Feld via
-       Missbrauch von threshold_lin als Rohwert: */
-    l->threshold_lin = max_vrms; /* vorlaeufig: Rohspannung, s.u. */
+    /* threshold_lin gets its final value later (after the chain is
+       resolved). Until then threshold_lin holds the raw max_vrms: */
+    l->threshold_lin = max_vrms; /* temporary: raw voltage, see below */
     l->attack_coeff  = exp(-1.0 / (sample_rate * (attack_ms  / 1000.0)));
     l->release_coeff = exp(-1.0 / (sample_rate * (release_ms / 1000.0)));
     l->window_samples = sample_rate * (window_ms / 1000.0);
-    /* rms_release_coeff wird im release_coeff-Feld gefuehrt, wenn RMS: */
+    /* for RMS, release_coeff holds rms_release_coeff: */
     if (l->type == LIMIT_RMS) {
         l->release_coeff =
             exp(-1.0 / (sample_rate * (rms_release_ms / 1000.0)));
     }
-    if (ref_freq_hz > 0.0 && slope_db_oct != 0.0) {
+    if (l->integrator) {
+        /* Cue-020: leaky integrator, see struct limit_cfg. */
+        if (ref_freq_hz <= 0.0 || hp_corner_hz <= 0.0) {
+            fprintf(stderr, "PROTECT: limit '%s': weighting \"integrator\" "
+                    "needs ref_freq_hz and hp_corner_hz.\n", l->name);
+            return -1;
+        }
+        if (slope_db_oct != 0.0 && fabs(slope_db_oct - 6.0) > 0.01) {
+            fprintf(stderr, "PROTECT: limit '%s': weighting \"integrator\" "
+                    "is 6 dB/octave by definition; slope_db_oct %.2f is not "
+                    "allowed (omit it or give 6).\n", l->name, slope_db_oct);
+            return -1;
+        }
+        if (l->type == LIMIT_RMS) {
+            fprintf(stderr, "PROTECT: limit '%s': weighting \"integrator\" "
+                    "needs type \"peak\" (the RMS path ignores the "
+                    "weighting).\n", l->name);
+            return -1;
+        }
+        if (hp_corner_hz < 0.1) {
+            fprintf(stderr, "PROTECT: limit '%s': hp_corner_hz %.3f must be "
+                    ">= 0.1 Hz (below that the integrator state needs "
+                    "seconds to forget DC).\n", l->name, hp_corner_hz);
+            return -1;
+        }
+        if (hp_corner_hz > ref_freq_hz / 4.0) {
+            fprintf(stderr, "PROTECT: limit '%s': hp_corner_hz %.3f must be "
+                    "<= ref_freq_hz/4 (%.3f), else the detector is no "
+                    "integrator at ref_freq_hz.\n", l->name, hp_corner_hz,
+                    ref_freq_hz / 4.0);
+            return -1;
+        }
+        if (ref_freq_hz >= sample_rate / 4.0) {
+            fprintf(stderr, "PROTECT: limit '%s': ref_freq_hz %.1f must be "
+                    "below sample_rate/4.\n", l->name, ref_freq_hz);
+            return -1;
+        }
+        l->freq_weighted = 1;
+        l->shelf_poles = 1;
+        l->shelf_coeff = exp(-2.0 * M_PI * hp_corner_hz / sample_rate);
+        {
+            /* exact gain of the discrete filter (1-a)/(1 - a z^-1) at
+               ref_freq_hz; integ_gain = 1/|H| makes the detector gain 1
+               there. */
+            double a = l->shelf_coeff;
+            double w = 2.0 * M_PI * ref_freq_hz / sample_rate;
+            l->integ_gain = sqrt(1.0 - 2.0 * a * cos(w) + a * a) / (1.0 - a);
+        }
+        l->integ_ref_hz = ref_freq_hz;
+        l->integ_hp_hz = hp_corner_hz;
+    } else if (hp_corner_hz != 0.0) {
+        fprintf(stderr, "PROTECT: limit '%s': hp_corner_hz is only valid "
+                "with weighting \"integrator\".\n", l->name);
+        return -1;
+    } else if (ref_freq_hz > 0.0 && slope_db_oct != 0.0) {
         int poles = (int)(slope_db_oct / 6.0 + 0.5);
         if (poles < 1 || poles > MAX_SHELF_POLES ||
             fabs(slope_db_oct - poles * 6.0) > 0.01)
@@ -474,11 +600,11 @@ parse_limit(int (*get_config_token)(union bflexval *lexval),
         }
         l->freq_weighted = 1;
         l->shelf_poles = poles;
-        /* Kaskade von `poles` Einpol-Tiefpaessen, jeweils gleiche
-           Eckfrequenz = ref_freq_hz, um im Detektorpfad die physikalisch
-           mit der Frequenz steigende Grenze nachzubilden. 1 Stufe = 6dB/
-           Oktave (z.B. Trafo-Kernsaettigung), 2 Stufen = 12dB/Oktave
-           (z.B. Xmax einer geschlossenen Box unterhalb/oberhalb Fc). */
+        /* Cascade of `poles` one-pole low-passes, each with the corner
+           frequency ref_freq_hz. In the detector path it models the
+           physical ceiling that rises with the frequency. 1 stage =
+           6 dB/octave (for example transformer core saturation), 2 stages
+           = 12 dB/octave (for example Xmax of a sealed box around Fc). */
         l->shelf_coeff = exp(-2.0 * M_PI * ref_freq_hz / sample_rate);
     }
     if (l->signed_weight && !l->freq_weighted) {
@@ -563,14 +689,13 @@ parse_group(int (*get_config_token)(union bflexval *lexval),
     }
     if (g->n_limits == 0) {
         fprintf(stderr, "PROTECT: group has no limit checkpoints -- "
-                "waere wirkungslos.\n");
+                "it would have no effect.\n");
         return -1;
     }
-    /* Jetzt die eigentliche normierte Schwelle aus max_vrms (bisher im
-       threshold_lin-Feld zwischengespeichert) + chain-Gain berechnen.
-       Pro Limit: "stage" (falls gesetzt) ueberschreibt, an wie vielen
-       Stufen der Chain gemessen wird -- kein Aufaddieren zur vollen
-       Chain-Verstaerkung, ein reiner Ersatzwert dafuer. */
+    /* Now calculate the normalised threshold from max_vrms (held in
+       threshold_lin until now) and the chain gain. Per limit: "stage"
+       (if set) replaces the number of chain stages the limit is measured
+       after. It does not add to the full chain gain; it replaces it. */
     {
         struct chain *c = &chains[g->chain_index];
         for (int l = 0; l < g->n_limits; l++) {
@@ -598,9 +723,26 @@ parse_group(int (*get_config_token)(union bflexval *lexval),
             fprintf(stderr, "PROTECT: group chain='%s' limit='%s'%s: "
                     "%.3f Vrms -> %.2f dBFS%s\n",
                     c->name, lc->name,
-                    lc->stage > 0 ? " (partielle Chain)" : "",
+                    lc->stage > 0 ? " (partial chain)" : "",
                     max_vrms_raw, 20.0 * log10(lc->threshold_lin),
-                    lc->freq_weighted ? " (frequenzgewichtet)" : "");
+                    lc->freq_weighted ? " (frequency-weighted)" : "");
+            if (lc->integrator) {
+                /* ceiling(f) = max_vrms / (integ_gain * |H(f)|) */
+                static const double fs_log[4] = { 10.0, 20.0, 40.0, 0.0 };
+                double a = lc->shelf_coeff, ceil_v[4];
+                for (int k = 0; k < 4; k++) {
+                    double f = fs_log[k] > 0.0 ? fs_log[k] : lc->integ_ref_hz;
+                    double w = 2.0 * M_PI * f / sample_rate;
+                    double h = (1.0 - a) / sqrt(1.0 - 2.0 * a * cos(w) + a * a);
+                    ceil_v[k] = max_vrms_raw / (lc->integ_gain * h);
+                }
+                fprintf(stderr, "PROTECT:   limit='%s' integrator: hp corner "
+                        "%.2f Hz, normalised at %.1f Hz; ceiling %.1f V @ "
+                        "%.1f Hz, %.1f V @ 40 Hz, %.1f V @ 20 Hz, %.1f V @ "
+                        "10 Hz\n", lc->name, lc->integ_hp_hz, lc->integ_ref_hz,
+                        ceil_v[3], lc->integ_ref_hz, ceil_v[2], ceil_v[1],
+                        ceil_v[0]);
+            }
         }
     }
     return 0;
@@ -869,6 +1011,84 @@ resolve_links(const int n_channels[2], const struct bfchannel *channels[2])
 
 /* ---- Kern: Sample-Verarbeitung ----------------------------------------- */
 
+/* Cue-020, weighting "integrator", stage 1 (smooth gain): leaky integrator
+   on the signed INPUT sample, normalised to gain 1 at ref_freq_hz. A
+   non-finite state (NaN/Inf input) is reset to 0 so that it cannot
+   disable the detector for good. */
+static inline double
+integ_detect(struct limit_cfg *lc, struct limit_state *ls, double s)
+{
+    ls->shelf_z1 = (1.0 - lc->shelf_coeff) * s + lc->shelf_coeff * ls->shelf_z1;
+    if (!isfinite(ls->shelf_z1)) ls->shelf_z1 = 0.0;
+    return lc->integ_gain * fabs(ls->shelf_z1);
+}
+
+/* Cue-020, weighting "integrator", stage 2 (exact backstop), on the FINAL
+   output samples of one channel (after all limits, link and lookahead).
+   Stage 1 alone does not bound the output flux: its gain acts on the
+   voltage while the flux integrates over the past, so on a hard onset
+   the output flux overshoots (measured: 2.8x the ceiling for a 20 Hz
+   burst that starts at zero phase). Here, per sample and per enabled
+   integrator limit, with P = flux_out[n-1] and c = shelf_coeff:
+     q = c*P + (1-c)*y;  if |q| > F (F = threshold_lin/integ_gain)
+         y := (sign(q)*F - c*P) / (1-c)
+   Induction: |P| <= F, so |c*P| < F, so the new y has the sign of the
+   old y and a smaller magnitude (a gain in [0,1)), and |flux_out| <= F
+   holds after every sample. Several integrator limits: each one only
+   shrinks y towards 0; the bound of an earlier one stays true (it holds
+   at y = 0 and at its own y, so on the whole interval between). All
+   states are updated with the final y, also of limits switched off by
+   "lmc ... off" or "enabled: 0;", so the flux is right when the limit is
+   switched on again (it is deliberately NOT reset on enable: a reset
+   would forget real flux). Then |P| > F is possible and the induction
+   does not hold for the first samples; the guard below (sec-dude
+   P-020-1) limits y to a gain in [0,1] (0 in the worst case), so the
+   module never makes a sample larger or flips its sign, and the flux
+   falls back under F by the leak (time constant 1/(2*pi*hp_corner_hz),
+   80 ms at 2 Hz). Hot path: no calls, no allocation. */
+static inline void
+flux_backstop(struct group *g, struct channel_runtime *rt, double *samples,
+              int n)
+{
+    int any = 0;
+    for (int l = 0; l < g->n_limits; l++) {
+        if (g->limits[l].integrator) { any = 1; break; }
+    }
+    if (!any) return;
+    for (int i = 0; i < n; i++) {
+        double y = samples[i];
+        if (!isfinite(y)) continue;          /* existing behaviour for NaN/Inf */
+        for (int l = 0; l < g->n_limits; l++) {
+            struct limit_cfg *lc = &g->limits[l];
+            if (!lc->integrator || !lc->enabled) continue;
+            struct limit_state *ls = &rt->st[l];
+            double c = lc->shelf_coeff, F = lc->threshold_lin / lc->integ_gain;
+            double p = c * ls->flux_out;
+            double q = p + (1.0 - c) * y;
+            if (fabs(q) > F) {
+                double yn = (copysign(F, q) - p) / (1.0 - c);
+                /* P-020-1 guard: only a gain in [0,1] is allowed. If |P|
+                   > F (state tracked while the limit was off, then "lmc
+                   on"), yn could flip the sign or grow; the best this
+                   sample can do is 0. The flux then decays by c per
+                   sample until the bound holds again. No-op while
+                   |P| <= F. */
+                if (!(yn * y >= 0.0) || fabs(yn) > fabs(y)) yn = 0.0;
+                y = yn;
+                ls->flux_clips++;
+            }
+        }
+        samples[i] = y;
+        for (int l = 0; l < g->n_limits; l++) {
+            struct limit_cfg *lc = &g->limits[l];
+            if (!lc->integrator) continue;   /* also while off: state stays real */
+            struct limit_state *ls = &rt->st[l];
+            ls->flux_out = lc->shelf_coeff * ls->flux_out +
+                           (1.0 - lc->shelf_coeff) * y;
+        }
+    }
+}
+
 /* Detector + checkpoint smoothing for ONE sample: unchanged v3 code, only
    moved out of process_channel() so that the plain path and the link path
    share exactly the same detector (design 3.2: the invariant rests on the
@@ -888,21 +1108,22 @@ detect_sample(struct group *g, struct channel_runtime *rt, double s)
             struct limit_state *ls = &rt->st[l];
             double detect_mag = mag;
 
-            if (!lc->enabled) {          /* v3: per Kommando abgeschaltet */
+            if (!lc->enabled) {          /* v3: switched off by command */
                 ls->gain = 1.0;
                 continue;
             }
 
-            if (lc->freq_weighted && lc->signed_weight) {
-                /* v3: Tiefpass-Kaskade auf das VORZEICHENBEHAFTETE Signal,
-                   danach Betrag. Das ist die Uebertragungsfunktion
-                   Spannung -> Membranauslenkung einer geschlossenen Box
-                   (2 gleiche Einpol-Tiefpaesse = Q 0,5, Qtc der Box 0,49):
-                   die zulaessige Spitzenspannung ist max_vrms*(1+(f/fc)^2).
-                   Im Altpfad (erst fabs, dann Tiefpass) bleibt der
-                   Gleichanteil des gleichgerichteten Signals ungedaempft
-                   und die Gewichtung wirkt nur bei sehr tiefen
-                   Frequenzen. */
+            if (lc->integrator) {
+                detect_mag = integ_detect(lc, ls, s);
+            } else if (lc->freq_weighted && lc->signed_weight) {
+                /* v3: low-pass cascade on the SIGNED signal, then the
+                   magnitude. This is the transfer function voltage ->
+                   diaphragm excursion of a sealed box (2 equal one-pole
+                   low-passes = Q 0.5; Qtc of the box 0.49): the allowed
+                   peak voltage is max_vrms*(1+(f/fc)^2). In the old path
+                   (fabs first, then low-pass) the DC part of the rectified
+                   signal is not attenuated, so the weighting acts only at
+                   very low frequencies. */
                 ls->shelf_z1 = (1.0 - lc->shelf_coeff) * s +
                                 lc->shelf_coeff * ls->shelf_z1;
                 detect_mag = ls->shelf_z1;
@@ -913,12 +1134,12 @@ detect_sample(struct group *g, struct channel_runtime *rt, double s)
                 }
                 detect_mag = fabs(detect_mag);
             } else if (lc->freq_weighted) {
-                /* Kaskade von Einpol-Tiefpaessen (shelf_poles Stufen,
-                   gleiche Eckfrequenz) auf den Detektor-Eingang dieses
-                   Checkpoints, bildet die mit der Frequenz steigende
-                   physikalische Grenze nach -- 1 Stufe = 6dB/Oktave
-                   (z.B. Trafo-Kernfluss), 2 Stufen = 12dB/Oktave (z.B.
-                   Xmax einer geschlossenen Box). */
+                /* Cascade of one-pole low-passes (shelf_poles stages,
+                   same corner frequency) on the detector input of this
+                   checkpoint. It models the physical ceiling that rises
+                   with the frequency: 1 stage = 6 dB/octave (for example
+                   transformer core flux), 2 stages = 12 dB/octave (for
+                   example Xmax of a sealed box). */
                 ls->shelf_z1 = (1.0 - lc->shelf_coeff) * mag +
                                 lc->shelf_coeff * ls->shelf_z1;
                 detect_mag = ls->shelf_z1;
@@ -958,6 +1179,143 @@ detect_sample(struct group *g, struct channel_runtime *rt, double s)
     return combined;
 }
 
+static inline struct la_state *
+la_get(int gi, int ci, int l)
+{
+    return &la_st[(gi * MAX_CH_PER_GROUP + ci) * MAX_LIMITS_PER_GROUP + l];
+}
+
+/* Weighted detector magnitude of one sample (same code as detect_sample). */
+static inline double
+weighted_mag(struct limit_cfg *lc, struct limit_state *ls, double s)
+{
+    double d;
+    if (!lc->freq_weighted) return fabs(s);
+    if (lc->integrator) return integ_detect(lc, ls, s);
+    if (lc->signed_weight) {
+        ls->shelf_z1 = (1.0 - lc->shelf_coeff) * s + lc->shelf_coeff * ls->shelf_z1;
+        d = ls->shelf_z1;
+        if (lc->shelf_poles == 2) {
+            ls->shelf_z2 = (1.0 - lc->shelf_coeff) * d + lc->shelf_coeff * ls->shelf_z2;
+            d = ls->shelf_z2;
+        }
+        return fabs(d);
+    }
+    ls->shelf_z1 = (1.0 - lc->shelf_coeff) * fabs(s) + lc->shelf_coeff * ls->shelf_z1;
+    d = ls->shelf_z1;
+    if (lc->shelf_poles == 2) {
+        ls->shelf_z2 = (1.0 - lc->shelf_coeff) * d + lc->shelf_coeff * ls->shelf_z2;
+        d = ls->shelf_z2;
+    }
+    return d;
+}
+
+/* Lookahead detector: input sample s (time n = sample counter k), returns
+   the combined gain for the sample of time n-D. */
+static inline double
+detect_sample_la(struct group *g, struct channel_runtime *rt, int gi, int ci,
+                 double s, long k)
+{
+    const int L = la_L;
+    const int p = (int)(k % L);
+    const int pd = (p + 1 == L) ? 0 : p + 1;
+    double combined = 1.0;
+
+    for (int l = 0; l < g->n_limits; l++) {
+        struct limit_cfg *lc = &g->limits[l];
+        struct limit_state *ls = &rt->st[l];
+        struct la_state *la = la_get(gi, ci, l);
+        double target, alpha;
+
+        if (!lc->enabled) {
+            ls->gain = 1.0;
+            continue;
+        }
+        if (lc->type == LIMIT_RMS) {        /* unchanged v3 smoothing */
+            ls->rms_sumsq += (s * s - ls->rms_sumsq) * (1.0 / lc->window_samples);
+            if (ls->rms_sumsq > lc->threshold_lin * lc->threshold_lin) {
+                target = sqrt((lc->threshold_lin * lc->threshold_lin) / ls->rms_sumsq);
+                ls->overs++;
+            } else {
+                target = 1.0;
+            }
+            alpha = (target < ls->gain) ? lc->attack_coeff : lc->release_coeff;
+            ls->gain = target + alpha * (ls->gain - target);
+            if (ls->gain < combined) combined = ls->gain;
+            continue;
+        }
+
+        double mag = weighted_mag(lc, ls, s);
+        double r = (mag > lc->threshold_lin) ? (lc->threshold_lin / mag) : 1.0;
+        if (r < 0.999) ls->overs++;
+
+        /* sliding minimum over the last L r-values (monotonic deque).
+           Drop the entry that left the window FIRST, so the deque never
+           holds more than L entries. */
+        while (la->dq_cnt > 0 && la->dq_idx[la->dq_head] <= k - L) {
+            la->dq_head = (la->dq_head + 1 == L) ? 0 : la->dq_head + 1;
+            la->dq_cnt--;
+        }
+        while (la->dq_cnt > 0) {
+            int b = la->dq_head + la->dq_cnt - 1;
+            if (b >= L) b -= L;
+            if (la->dq_val[b] >= r) la->dq_cnt--; else break;
+        }
+        {
+            int b = la->dq_head + la->dq_cnt;
+            if (b >= L) b -= L;
+            la->dq_val[b] = r;
+            la->dq_idx[b] = k;
+            la->dq_cnt++;
+        }
+        double m = la->dq_val[la->dq_head];
+
+        /* box average of the minima over L samples */
+        la->sum += m - la->mring[p];
+        la->mring[p] = m;
+        if (p == L - 1) {                   /* re-sum once per L: no drift */
+            double t = 0.0;
+            for (int j = 0; j < L; j++) t += la->mring[j];
+            la->sum = t;
+        }
+        la->rring[p] = r;
+        double r_del = la->rring[pd];       /* r of the delayed sample n-D */
+        double avg = la->sum / (double)L;
+
+        /* release only slows increases; never above avg or r_del */
+        double gg = (avg < ls->gain) ? avg
+                    : avg + lc->release_coeff * (ls->gain - avg);
+        if (gg > r_del) gg = r_del;
+        ls->gain = gg;
+        if (gg < combined) combined = gg;
+    }
+    return combined;
+}
+
+/* Audio delay by D = L-1 samples (lookahead). */
+static inline double
+la_delay(int channel, double s, long k)
+{
+    const int L = la_L;
+    const int p = (int)(k % L);
+    double *d = la_dly[channel];
+    d[p] = s;
+    return d[(p + 1 == L) ? 0 : p + 1];
+}
+
+static inline void
+process_channel_la(struct group *g, int gi, int ci, int channel,
+                   double *samples, int n)
+{
+    struct channel_runtime *rt = &ch_runtime[gi][ci];
+    for (int i = 0; i < n; i++) {
+        long k = la_n[channel]++;
+        double s = samples[i];
+        double gn = detect_sample_la(g, rt, gi, ci, s, k);
+        samples[i] = la_delay(channel, s, k) * gn;
+    }
+}
+
 static inline void
 process_channel(struct group *g, int gi, int ci, double *samples, int n)
 {
@@ -977,8 +1335,8 @@ process_channel(struct group *g, int gi, int ci, double *samples, int n)
    block (published to the partners - never the linked gain, design 2.3
    point 2, otherwise symmetric links latch). */
 static inline double
-process_channel_link(struct group *g, int gi, int ci, double *samples,
-                     int n, double L_prev, double L_tgt)
+process_channel_link(struct group *g, int gi, int ci, int channel,
+                     double *samples, int n, double L_prev, double L_tgt)
 {
     struct channel_runtime *rt = &ch_runtime[gi][ci];
     double own_min = 1.0;
@@ -986,7 +1344,14 @@ process_channel_link(struct group *g, int gi, int ci, double *samples,
 
     for (int i = 0; i < n; i++) {
         double s = samples[i];
-        double combined = detect_sample(g, rt, s);
+        double combined;
+        if (la_L > 0) {
+            long k = la_n[channel]++;
+            combined = detect_sample_la(g, rt, gi, ci, s, k);
+            s = la_delay(channel, s, k);
+        } else {
+            combined = detect_sample(g, rt, s);
+        }
         if (combined < own_min) own_min = combined;
         double L_i = L_prev + dL * (double)(i + 1) / (double)n;
         /* NaN-safe: a NaN L_i compares false -> own gain is applied */
@@ -1043,9 +1408,22 @@ output_timed(void *buf, int channel)
     float *fbuf = NULL;
     int n = block_length;
 
-    if (channel < 0 || channel >= MAX_MAPPED_CHANNELS ||
-        chan_group[channel] < 0)
-    {
+    if (channel < 0 || channel >= MAX_MAPPED_CHANNELS) {
+        return;
+    }
+    if (chan_group[channel] < 0) {
+        if (la_L > 0) {          /* keep alignment: unmapped outputs delayed too */
+            for (int i = 0; i < n; i++) {
+                long k = la_n[channel]++;
+                if (realsize == 4) {
+                    float *f = (float *)buf;
+                    f[i] = (float)la_delay(channel, f[i], k);
+                } else {
+                    double *d = (double *)buf;
+                    d[i] = la_delay(channel, d[i], k);
+                }
+            }
+        }
         return;
     }
     gi = chan_group[channel];
@@ -1061,8 +1439,12 @@ output_timed(void *buf, int channel)
 
     li = chan_link[channel];
     if (li < 0) {
-        /* no link: unchanged v3 path */
-        process_channel(&groups[gi], gi, ci, samples, n);
+        /* no link: unchanged v3 path (or lookahead) */
+        if (la_L > 0) {
+            process_channel_la(&groups[gi], gi, ci, channel, samples, n);
+        } else {
+            process_channel(&groups[gi], gi, ci, samples, n);
+        }
     } else {
         struct link_cfg *lk = &links[li];
         long k = ++blk_ctr[channel];
@@ -1073,14 +1455,18 @@ output_timed(void *buf, int channel)
         } else {
             L_prev = 1.0;        /* link off: immediately own limits only */
         }
-        double own_min = process_channel_link(&groups[gi], gi, ci, samples,
-                                              n, L_prev, L_tgt);
+        double own_min = process_channel_link(&groups[gi], gi, ci, channel,
+                                              samples, n, L_prev, L_tgt);
         link_prev[channel] = L_tgt;
         a_store_d(&link_now[channel], L_tgt);
         struct pub_slot *w = &pub[channel][k & 1];      /* always publish */
         a_store_d(&w->gmin, own_min);
         a_store_l(&w->blk, k);
     }
+
+    /* Cue-020: exact flux bound on the final output (returns at once when
+       the group has no enabled integrator limit). */
+    flux_backstop(&groups[gi], &ch_runtime[gi][ci], samples, n);
 
     if (fbuf != NULL) {
         for (int i = 0; i < n; i++) fbuf[i] = (float)tmp[i];
@@ -1163,6 +1549,15 @@ bflogic_preinit(/* bfmod.h names these (version_minor, version_major, ...),
             GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
             output_scale = lexval.real;
             GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
+        } else if (strcmp(lexval.field, "lookahead_ms") == 0) {
+            GET_TOKEN(BF_LEXVAL_REAL, "expected real.\n");
+            lookahead_ms = lexval.real;
+            GET_TOKEN(BF_LEX_EOS, "expected ';'.\n");
+            if (!(lookahead_ms >= 0.0 && lookahead_ms <= LA_MAX_MS)) {
+                fprintf(stderr, "PROTECT: lookahead_ms must be 0..%.0f, "
+                        "got %g.\n", LA_MAX_MS, lookahead_ms);
+                return -1;
+            }
         } else if (strcmp(lexval.field, "link") == 0) {
             char link_name[BF_MAXOBJECTNAME];
             GET_TOKEN(BF_LEXVAL_STRING, "expected link name string.\n");
@@ -1185,25 +1580,26 @@ bflogic_preinit(/* bfmod.h names these (version_minor, version_major, ...),
             GET_TOKEN(BF_LEX_EOS, "expected ';' after link block.\n");
             n_links++;
         } else {
-            fprintf(stderr, "PROTECT: expected 'chain', 'group', 'link' or "
-                    "'output_scale', got '%s'.\n", lexval.field);
+            fprintf(stderr, "PROTECT: expected 'chain', 'group', 'link', "
+                    "'output_scale' or 'lookahead_ms', got '%s'.\n",
+                    lexval.field);
             return -1;
         }
     }
 
-    /* threshold_lin (aus parse_group) ist bislang eine physikalisch
-       normierte 0..1-Vollausschlag-Ratio -- erst hier auf die reale
-       Roh-Puffer-Skala umrechnen, die output_timed() tatsaechlich sieht
-       (s.o., output_scale). Erst nach der ganzen Parse-Schleife, damit
-       "output_scale:" an beliebiger Stelle in der Config stehen darf. */
+    /* Until here threshold_lin (from parse_group) is a ratio to full
+       scale, 0..1. Convert it here to the raw buffer scale that
+       output_timed() really sees (see above, output_scale). This runs
+       after the whole parse loop, so "output_scale:" can be at any place
+       in the config. */
     for (int g = 0; g < n_groups; g++) {
         for (int l = 0; l < groups[g].n_limits; l++) {
             struct limit_cfg *lc = &groups[g].limits[l];
             double ratio = lc->threshold_lin;
             lc->threshold_lin = ratio * output_scale;
-            fprintf(stderr, "PROTECT: group %d limit='%s': skaliert auf "
-                    "Puffereinheiten: %.1f (output_scale=%.1f, "
-                    "entspricht weiterhin %.2f dBFS)\n",
+            fprintf(stderr, "PROTECT: group %d limit='%s': scaled to "
+                    "buffer units: %.1f (output_scale=%.1f, "
+                    "still %.2f dBFS)\n",
                     g, lc->name, lc->threshold_lin, output_scale,
                     20.0 * log10(ratio));
         }
@@ -1251,9 +1647,61 @@ bflogic_preinit(/* bfmod.h names these (version_minor, version_major, ...),
         return -1;
     }
 
+    if (lookahead_ms > 0.0) {
+        long D = lround(lookahead_ms * sample_rate / 1000.0);
+        if (D >= 1) {
+            la_L = (int)D + 1;
+            size_t ns = (size_t)MAX_GROUPS * MAX_CH_PER_GROUP * MAX_LIMITS_PER_GROUP;
+            la_st = calloc(ns, sizeof(*la_st));
+            if (la_st == NULL) { fprintf(stderr, "PROTECT: out of memory.\n"); return -1; }
+            for (int g = 0; g < n_groups; g++)
+              for (c = 0; c < groups[g].n_channels; c++)
+                for (int l = 0; l < groups[g].n_limits; l++) {
+                    struct la_state *la = la_get(g, c, l);
+                    la->rring = malloc(la_L * sizeof(double));
+                    la->mring = malloc(la_L * sizeof(double));
+                    la->dq_val = malloc(la_L * sizeof(double));
+                    la->dq_idx = malloc(la_L * sizeof(long));
+                    if (!la->rring || !la->mring || !la->dq_val || !la->dq_idx) {
+                        fprintf(stderr, "PROTECT: out of memory.\n");
+                        return -1;
+                    }
+                }
+            for (i = 0; i < MAX_MAPPED_CHANNELS; i++) {
+                la_dly[i] = calloc(la_L, sizeof(double));
+                if (la_dly[i] == NULL) { fprintf(stderr, "PROTECT: out of memory.\n"); return -1; }
+            }
+            fprintf(stderr, "PROTECT: lookahead %.3f ms = %ld samples on "
+                    "every output (peak limits: sliding-min + %d-sample "
+                    "ramp, attack_ms unused)\n", lookahead_ms, D, la_L);
+        }
+    }
+
     bfevents->output_timed = output_timed;
     *fork_mode = BF_FORK_DONT_FORK;
     return 0;
+}
+
+static void
+la_runtime_reset(void)
+{
+    if (la_L <= 0) return;
+    for (int g = 0; g < n_groups; g++)
+      for (int c = 0; c < groups[g].n_channels; c++)
+        for (int l = 0; l < groups[g].n_limits; l++) {
+            struct la_state *la = la_get(g, c, l);
+            for (int j = 0; j < la_L; j++) {
+                la->rring[j] = 1.0;
+                la->mring[j] = 1.0;
+            }
+            la->sum = (double)la_L;
+            la->dq_head = 0;
+            la->dq_cnt = 0;
+        }
+    for (int i = 0; i < MAX_MAPPED_CHANNELS; i++) {
+        memset(la_dly[i], 0, la_L * sizeof(double));
+        la_n[i] = 0;
+    }
 }
 
 static void
@@ -1297,6 +1745,7 @@ bflogic_init(struct bfaccess *bfaccess,
         }
     }
     link_runtime_reset();
+    la_runtime_reset();
     if (n_links > 0) {
         fprintf(stderr, "PROTECT: initialised, %d chain(s), %d group(s), "
                 "%d link(s), realsize=%d\n", n_chains, n_groups, n_links,
@@ -1454,7 +1903,8 @@ bflogic_command(const char params[])
                     lc->name, lc->enabled ? "ON" : "off",
                     lc->type == LIMIT_RMS ? "rms" : "peak",
                     !lc->freq_weighted ? "-" :
-                        (lc->signed_weight ? "signed" : "abs"),
+                        (lc->integrator ? "integ" :
+                         (lc->signed_weight ? "signed" : "abs")),
                     20.0 * log10(lc->threshold_lin / output_scale),
                     lc->always_on ? "  (always_on)" : "");
             }
@@ -1478,16 +1928,16 @@ bflogic_command(const char params[])
                 struct limit_cfg *lc = &groups[g].limits[l];
                 if (!all && strcmp(lc->name, nm) != 0) continue;
                 if (!turn_on) {
-                    /* mindestens ein NICHT-always_on-Limit (Xmax/THD)
-                       muss aktiv bleiben, sonst laeuft die Gruppe nur
-                       noch mit Verstaerker-Clip und Thermik */
+                    /* at least one limit that is NOT always_on
+                       (Xmax/THD) must stay on; otherwise the group runs
+                       with amplifier clipping and thermal limits only */
                     int others = 0;
                     for (int m = 0; m < groups[g].n_limits; m++)
                         if (m != l && groups[g].limits[m].enabled &&
                             !groups[g].limits[m].always_on) others++;
                     if (lc->always_on || others == 0) {
                         refused++;
-                        continue;      /* nie die letzte Absicherung weg */
+                        continue;      /* never remove the last protection */
                     }
                     lc->enabled = 0;
                 } else if (!lc->enabled) {

@@ -42,7 +42,15 @@ echo "[run_tests] shell: $BASH $BASH_VERSION, $(uname -sr), $(gcc --version | he
 echo "[run_tests] source: $root, build dir: $out"
 
 CFLAGS_STRICT="-std=c99 -D_POSIX_C_SOURCE=200809L -O2 -fPIC -Wall -Wextra"
-INC="-I$root/ref/bf112"
+# Reference inputs (not built from src/), see ref/README.md:
+#   BF_INC_DIR  dir with BruteFIR 1.1.2 bfmod.h      (default <repo>/ref/bf112)
+#   REF_SRC     the deployed module, T1b reference    (default <repo>/ref/bflogic_protect.deployed.c)
+bfinc=${BF_INC_DIR:-$root/ref/bf112}
+refsrc=${REF_SRC:-$root/ref/bflogic_protect.deployed.c}
+[ -f "$bfinc/bfmod.h" ] || { echo "[run_tests] $bfinc/bfmod.h not found: copy src/bfmod.h of BruteFIR v1.1.2 there or set BF_INC_DIR (ref/README.md)" >&2; exit 2; }
+[ -f "$refsrc" ] || { echo "[run_tests] $refsrc not found: set REF_SRC to the deployed module source (ref/README.md)" >&2; exit 2; }
+echo "[run_tests] bfmod.h: $bfinc, reference: $refsrc ($(sha256sum "$refsrc" | cut -c1-12))"
+INC="-I$bfinc"
 fail=0
 
 warn_count() {  # $1 = source; prints warnings (normalised) to $2
@@ -54,7 +62,7 @@ warn_count() {  # $1 = source; prints warnings (normalised) to $2
 }
 
 echo; echo "== build: module (-Wall -Wextra, strict C99) =="
-warn_count "$root/ref/bflogic_protect.deployed.c" "$out/warn_ref.txt"; rc_ref=$?
+warn_count "$refsrc" "$out/warn_ref.txt"; rc_ref=$?
 warn_count "$root/src/bflogic_protect.c" "$out/warn_new.txt"; rc_new=$?
 echo "  reference (deployed) : exit $rc_ref, $(wc -l < "$out/warn_ref.txt") warning(s)"
 echo "  new (link)           : exit $rc_new, $(wc -l < "$out/warn_new.txt") warning(s)"
@@ -66,14 +74,14 @@ else
   echo "  PASS no new warnings"
 fi
 # the real module build as the Makefile does it (BRUTEFIR_SRC layout)
-mkdir -p "$out/bfsrc/src" && cp "$root/ref/bf112/bfmod.h" "$out/bfsrc/src/"
+mkdir -p "$out/bfsrc/src" && cp "$bfinc/bfmod.h" "$out/bfsrc/src/"
 make -s -C "$root" BRUTEFIR_SRC="$out/bfsrc" CFLAGS="-O2 -fPIC -Wall -Wextra" TARGET="$out/protect.bflogic" >/dev/null 2>"$out/make.err" \
   && echo "  PASS make (Makefile) -> protect.bflogic" || { echo "  FAIL make"; cat "$out/make.err"; fail=1; }
 
 echo; echo "== build: harness =="
 HFLAGS="-std=gnu99 -O2 -g -Wall -Wextra -pthread $INC"
 gcc $HFLAGS -DMODULE_SRC="\"$root/src/bflogic_protect.c\"" -o "$out/harness_new" "$here/harness.c" -lm 2>>"$out/harness_build.log" || fail=1
-gcc $HFLAGS -DMODULE_SRC="\"$root/ref/bflogic_protect.deployed.c\"" -DREFERENCE_BUILD -o "$out/harness_ref" "$here/harness.c" -lm 2>>"$out/harness_build.log" || fail=1
+gcc $HFLAGS -DMODULE_SRC="\"$refsrc\"" -DREFERENCE_BUILD -o "$out/harness_ref" "$here/harness.c" -lm 2>>"$out/harness_build.log" || fail=1
 gcc -std=gnu99 -O1 -g -fsanitize=thread -pthread $INC -DMODULE_SRC="\"$root/src/bflogic_protect.c\"" -o "$out/harness_tsan" "$here/harness.c" -lm 2>>"$out/harness_build.log" || fail=1
 WRAPS="malloc calloc realloc free vfprintf fprintf fwrite fputs fputc write vsnprintf snprintf"
 gcc $HFLAGS -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DHOTPATH_WRAP -DMODULE_SRC="\"$root/src/bflogic_protect.c\"" \
@@ -84,6 +92,9 @@ echo; echo "== tests =="
 OUT="$out" ROOT="$root" HERE="$here" bash "$here/tests.sh"
 rc=$?
 [ $rc -ne 0 ] && fail=1
+
+echo; echo "== tests: weighting \"integrator\" (Cue-020) =="
+OUT="$out" ROOT="$root" INC="$INC" bash "$here/integ/integ_tests.sh" || fail=1
 echo
 [ $fail -eq 0 ] && echo "[run_tests] RESULT: ALL PASS" || echo "[run_tests] RESULT: FAILURES"
 exit $fail
